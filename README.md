@@ -51,9 +51,22 @@ RUNNING -- walkthrough mode:
     ./terrain_viewer [cody|meeteetse|bighorn]
 
 Defaults to `cody`. WASD to move, Shift to sprint, mouse to look around
-(pitch clamped to +/-89 degrees), Esc to quit. It's shaded by an elevation
-color ramp (dark green low, tan mid, white near the top of whatever range
-the current window spans) since no orthophoto imagery is loaded.
+(pitch clamped to +/-89 degrees), scroll wheel to zoom, Esc to quit. It's
+shaded by an elevation color ramp (dark green low, tan mid, white near the
+top of whatever range the current window spans) since no orthophoto
+imagery is loaded. The top-right HUD shows your current compass heading
+(degrees, 0 = north, clockwise -- plus the 16-point label, N/NNE/NE/.../
+NNW) and the current field of view.
+
+The default 45 degree vertical FOV (`FOV_DEFAULT_DEG`) is already narrower
+than raylib's usual 70 degree default on purpose: a wide FOV is much wider
+than the angle your monitor actually subtends in your real field of view
+from a normal desk-viewing distance, so distant features (a mountain miles
+off) render proportionally smaller on screen than they actually look
+standing there in person, even though every distance/geometry is correct.
+Scroll to zoom from `FOV_MIN_DEG` (4, a tight telephoto-like look at
+something distant) up to `FOV_MAX_DEG` (90, wide-angle); `TV_FOV` sets the
+starting value (mainly for `TV_SCREENSHOT` testing, see below).
 
 The terrain is one regenerable heightfield window, rebuilt (not every
 frame) once you've walked far enough from its center or turned more than
@@ -89,9 +102,10 @@ libtiff's own defaults rather than anything explicit in `dtm.c`.
 `TV_LAT`/`TV_LON` override the starting point; `TV_SCREENSHOT` (a filename)
 plus `TV_SCREENSHOT_FRAME` (a frame count, default 30) take a screenshot
 and exit -- a headless-testing convenience for automated/remote runs.
-`TV_YAW`/`TV_PITCH` set the starting look direction (mouse-look is skipped
-entirely when `TV_SCREENSHOT` is set, since a headless run has no real
-pointer and would otherwise drift non-deterministically).
+`TV_YAW`/`TV_PITCH`/`TV_FOV` set the starting look direction and zoom
+(mouse-look and scroll-to-zoom are both skipped entirely when
+`TV_SCREENSHOT` is set, since a headless run has no real pointer and would
+otherwise drift non-deterministically).
 
 RUNNING -- elevation profile mode:
 

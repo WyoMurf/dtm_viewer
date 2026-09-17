@@ -51,6 +51,20 @@ static DtmSet g_dtm = { 0 };
 #define SPRINT_MULT 3.0f
 #define MOUSE_SENSITIVITY 0.12f
 
+/* Default vertical FOV, and the scroll-wheel zoom range around it. 70 deg
+ * (raylib/many games' usual default) is much wider than the angle a
+ * monitor actually subtends in your real field of view from a normal
+ * viewing distance -- rendering at that FOV makes anything far away (a
+ * mountain miles off) look proportionally smaller on screen than it
+ * really looks standing there in person, even though the geometry/
+ * distances are all correct. 45 deg is a closer match for a typical
+ * "sit at a desk" monitor distance; scrolling zooms further in for a
+ * telephoto-like close look at something distant (e.g. Heart Mountain). */
+#define FOV_DEFAULT_DEG 45.0f
+#define FOV_MIN_DEG 4.0f
+#define FOV_MAX_DEG 90.0f
+#define FOV_ZOOM_SPEED_DEG 3.0f
+
 /* Smallest signed difference b-a, in degrees, wrapped to (-180, 180] --
  * for comparing two yaw angles that both accumulate unbounded (mouse-look
  * just adds/subtracts degrees with no wraparound) without a 359-vs-1
@@ -59,6 +73,27 @@ static float AngleDiffDeg(float a, float b) {
     float d = fmodf(b - a + 180.0f, 360.0f);
     if (d < 0) d += 360.0f;
     return d - 180.0f;
+}
+
+/* wc.yaw (see WalkForward) already IS a compass bearing -- 0 at north,
+ * increasing clockwise through east -- it just accumulates unbounded
+ * (mouse-look adds/subtracts degrees with no wraparound), so this only
+ * needs to fold it into [0, 360). */
+static float CompassHeadingDeg(float yawDeg) {
+    float h = fmodf(yawDeg, 360.0f);
+    if (h < 0) h += 360.0f;
+    return h;
+}
+
+/* Standard 16-point compass rose abbreviation for a heading already
+ * normalized to [0, 360) by CompassHeadingDeg. */
+static const char *CompassLabel(float headingDeg) {
+    static const char *labels[16] = {
+        "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+        "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"
+    };
+    int idx = (int)((headingDeg + 11.25f) / 22.5f) % 16;
+    return labels[idx];
 }
 
 /* --- Gribb-Hartmann frustum extraction, verbatim from earth_viewer.c/viewer.c --- */
@@ -369,6 +404,7 @@ static void BuildTerrainWindow(TerrainWindow *tw, double originLat, double origi
 typedef struct {
     Vector3 position; /* world meters, relative to walk origin */
     float yaw, pitch;  /* degrees */
+    float fovy;        /* degrees; scroll wheel zooms, see FOV_* constants */
 } WalkCamera;
 
 static Vector3 WalkForward(const WalkCamera *wc) {
@@ -386,6 +422,10 @@ static void UpdateWalkCamera(WalkCamera *wc, double originLat, double originLon,
         Vector2 md = GetMouseDelta();
         wc->yaw += md.x * MOUSE_SENSITIVITY;
         wc->pitch -= md.y * MOUSE_SENSITIVITY;
+
+        wc->fovy -= GetMouseWheelMove() * FOV_ZOOM_SPEED_DEG;
+        if (wc->fovy < FOV_MIN_DEG) wc->fovy = FOV_MIN_DEG;
+        if (wc->fovy > FOV_MAX_DEG) wc->fovy = FOV_MAX_DEG;
     }
     if (wc->pitch > 89.0f) wc->pitch = 89.0f;
     if (wc->pitch < -89.0f) wc->pitch = -89.0f;
@@ -430,12 +470,12 @@ static int RunWalkMode(double startLat, double startLon) {
     wc.position = (Vector3){ 0, (float)EYE_HEIGHT_M, 0 };
     wc.yaw = getenv("TV_YAW") ? (float)atof(getenv("TV_YAW")) : 0.0f;
     wc.pitch = getenv("TV_PITCH") ? (float)atof(getenv("TV_PITCH")) : -5.0f;
+    wc.fovy = getenv("TV_FOV") ? (float)atof(getenv("TV_FOV")) : FOV_DEFAULT_DEG;
 
     TerrainWindow terrain = { 0 };
     BuildTerrainWindow(&terrain, originLat, originLon, originLat, originLon, originElevation, wc.yaw);
 
     Camera3D camera = { 0 };
-    camera.fovy = 70.0f;
     camera.projection = CAMERA_PERSPECTIVE;
     camera.up = (Vector3){ 0, 1, 0 };
 
@@ -463,6 +503,7 @@ static int RunWalkMode(double startLat, double startLon) {
         camera.position = wc.position;
         Vector3 forward = WalkForward(&wc);
         camera.target = Vector3Add(wc.position, forward);
+        camera.fovy = wc.fovy;
 
         BeginDrawing();
         ClearBackground((Color){ 137, 187, 227, 255 });
@@ -485,7 +526,18 @@ static int RunWalkMode(double startLat, double startLon) {
             DrawText(TextFormat("lat=%.5f  lon=%.5f  elev=%.1fm  yaw=%.0f pitch=%.0f", lat, lon, elev, wc.yaw, wc.pitch), 10, 35, 18, RAYWHITE);
             DrawText(TextFormat("visible range: %.0fm ahead, %.0fm to the sides (curvature/obstacle-limited)", terrain.forwardM, terrain.sideM), 10, 58, 16, RAYWHITE);
         }
-        DrawText("WASD move, Shift sprint, mouse look, Esc to quit", 10, GetScreenHeight() - 30, 14, SKYBLUE);
+        {
+            float heading = CompassHeadingDeg(wc.yaw);
+            const char *compassText = TextFormat("%03.0f deg %s", heading, CompassLabel(heading));
+            int fontSize = 26;
+            int tw = MeasureText(compassText, fontSize);
+            DrawText(compassText, GetScreenWidth() - tw - 12, 10, fontSize, RAYWHITE);
+
+            const char *zoomText = TextFormat("FOV %.0f deg (scroll to zoom)", wc.fovy);
+            int tw2 = MeasureText(zoomText, 16);
+            DrawText(zoomText, GetScreenWidth() - tw2 - 12, 40, 16, SKYBLUE);
+        }
+        DrawText("WASD move, Shift sprint, mouse look, scroll to zoom, Esc to quit", 10, GetScreenHeight() - 30, 14, SKYBLUE);
         EndDrawing();
 
         if (screenshotPath && frameCount == screenshotFrame) {
