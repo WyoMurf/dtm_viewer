@@ -109,7 +109,22 @@ otherwise drift non-deterministically).
 
 RUNNING -- elevation profile mode:
 
-    ./terrain_viewer --profile lat1 lon1 lat2 lon2 [screenshot.png]
+    ./terrain_viewer --profile lat1 lon1 [+heightFt1] lat2 lon2 [+heightFt2] [screenshot.png]
+
+`+heightFt` is an optional mast/tower height in feet above ground at that
+endpoint -- e.g. a cell tower's antenna height, not a person standing
+there -- defaulting to 0 (ground level) when omitted. It must start with
+`+` (a bare number there is parsed as the next lat/lon instead), which
+also means it can't disambiguate a `+heightFt` from a positive
+(eastern-hemisphere) longitude typed with an explicit `+` -- not a
+concern for anything in Wyoming, where longitude is always negative.
+Endpoint markers get a short vertical mast line up from the ground when a
+height is given, and the "A"/"B" labels show ground/tower/total elevation
+separately (e.g. `1524m ground + 100ft = 1554m`) -- the tower height gets
+added on top of the ground elevation at that point for every part of the
+curvature/refraction sightline math and the endpoint markers, not just
+display; raising a tower's height on one or both ends is exactly how you'd
+check whether it clears a hill that blocks line-of-sight at ground level.
 
 Plots elevation vs. distance between the two points (great-circle path, via
 `geo_utils.h`'s `haversine_distance`/`initial_bearing`/`destination_point`),

@@ -588,11 +588,13 @@ static int RunWalkMode(double startLat, double startLon) {
 
 #define PROFILE_SAMPLES 500
 
-static int RunProfileMode(double lat1, double lon1, double lat2, double lon2, const char *screenshotPath) {
+#define FEET_TO_METERS 0.3048
+
+static int RunProfileMode(double lat1, double lon1, double heightFt1, double lat2, double lon2, double heightFt2, const char *screenshotPath) {
     double totalKm = haversine_distance(lat1, lon1, lat2, lon2, EARTH_RADIUS_KM);
     double bearing = initial_bearing(lat1, lon1, lat2, lon2);
-    printf("Profile: (%.5f,%.5f) -> (%.5f,%.5f), %.3f km, initial bearing %.1f deg\n",
-           lat1, lon1, lat2, lon2, totalKm, bearing);
+    printf("Profile: (%.5f,%.5f)+%.0fft -> (%.5f,%.5f)+%.0fft, %.3f km, initial bearing %.1f deg\n",
+           lat1, lon1, heightFt1, lat2, lon2, heightFt2, totalKm, bearing);
 
     double distKm[PROFILE_SAMPLES], elevM[PROFILE_SAMPLES];
     int haveData[PROFILE_SAMPLES];
@@ -622,8 +624,16 @@ static int RunProfileMode(double lat1, double lon1, double lat2, double lon2, co
      * raised reference curve, and apparentM is terrain height above it
      * (positive = blocks line-of-sight). */
     double effectiveRadiusKm = EARTH_RADIUS_KM * (4.0 / 3.0);
-    double elevValid1 = (elev1 == DTM_NODATA) ? elevM[0] : elev1;
-    double elevValid2 = (elev2 == DTM_NODATA) ? elevM[PROFILE_SAMPLES - 1] : elev2;
+    /* groundValid* is the bare terrain elevation at each endpoint (for
+     * drawing the mast up from the ground below); elevValid* adds the
+     * +heightFt mast/tower height on top of it -- e.g. a cell tower's
+     * antenna height above ground, not a person standing there -- and is
+     * what actually anchors the sightline chord/bulge and the endpoint
+     * markers below. */
+    double groundValid1 = (elev1 == DTM_NODATA) ? elevM[0] : elev1;
+    double groundValid2 = (elev2 == DTM_NODATA) ? elevM[PROFILE_SAMPLES - 1] : elev2;
+    double elevValid1 = groundValid1 + heightFt1 * FEET_TO_METERS;
+    double elevValid2 = groundValid2 + heightFt2 * FEET_TO_METERS;
     double sightlineM[PROFILE_SAMPLES], apparentM[PROFILE_SAMPLES];
     for (int i = 0; i < PROFILE_SAMPLES; i++) {
         double d = distKm[i];
@@ -697,11 +707,25 @@ static int RunProfileMode(double lat1, double lon1, double lat2, double lon2, co
             }
         }
 
+        /* Mast/tower line from the ground up to the actual sightline
+         * height, when a +heightFt was given -- makes clear the marker is
+         * an antenna height above ground, not a person standing there. */
+        if (heightFt1 > 0.0) DrawLine(SX(0), SY(groundValid1), SX(0), SY(elevValid1), (Color){ 90, 90, 90, 255 });
+        if (heightFt2 > 0.0) DrawLine(SX(totalKm), SY(groundValid2), SX(totalKm), SY(elevValid2), (Color){ 90, 90, 90, 255 });
         DrawCircle(SX(0), SY(elevValid1), 5, BLUE);
         DrawCircle(SX(totalKm), SY(elevValid2), 5, BLUE);
         DrawText(TextFormat("Total distance: %.3f km   (red = terrain blocking line-of-sight; thin red line = direct sightline incl. curvature+refraction)", totalKm), marginL, 8, 15, DARKGRAY);
-        DrawText(TextFormat("A (%.4f,%.4f) %.0fm", lat1, lon1, elevValid1), marginL, marginT - 22, 16, BLUE);
-        DrawText(TextFormat("B (%.4f,%.4f) %.0fm", lat2, lon2, elevValid2), marginL + plotW - 260, marginT - 22, 16, BLUE);
+        if (heightFt1 > 0.0) {
+            DrawText(TextFormat("A (%.4f,%.4f) %.0fm ground + %.0fft = %.0fm", lat1, lon1, groundValid1, heightFt1, elevValid1), marginL, marginT - 22, 16, BLUE);
+        } else {
+            DrawText(TextFormat("A (%.4f,%.4f) %.0fm", lat1, lon1, elevValid1), marginL, marginT - 22, 16, BLUE);
+        }
+        {
+            const char *bText = heightFt2 > 0.0
+                ? TextFormat("B (%.4f,%.4f) %.0fm ground + %.0fft = %.0fm", lat2, lon2, groundValid2, heightFt2, elevValid2)
+                : TextFormat("B (%.4f,%.4f) %.0fm", lat2, lon2, elevValid2);
+            DrawText(bText, marginL + plotW - MeasureText(bText, 16), marginT - 22, 16, BLUE);
+        }
 
         EndDrawing();
 
@@ -729,14 +753,33 @@ static void LoadDefaultDtmSet(void) {
 
 int main(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "--profile") == 0) {
+        static const char *usage = "usage: %s --profile lat1 lon1 [+heightFt1] lat2 lon2 [+heightFt2] [screenshot.png]\n"
+                                    "  +heightFt is an optional mast/tower height in feet above ground at that\n"
+                                    "  point (e.g. a cell tower's antenna height) -- must start with '+', or\n"
+                                    "  it's read as the next lat/lon instead; 0 (ground level) if omitted.\n";
         if (argc < 6) {
-            fprintf(stderr, "usage: %s --profile lat1 lon1 lat2 lon2 [screenshot.png]\n", argv[0]);
+            fprintf(stderr, usage, argv[0]);
             return 1;
         }
         LoadDefaultDtmSet();
-        double lat1 = atof(argv[2]), lon1 = atof(argv[3]), lat2 = atof(argv[4]), lon2 = atof(argv[5]);
-        const char *screenshot = argc >= 7 ? argv[6] : getenv("TV_SCREENSHOT");
-        return RunProfileMode(lat1, lon1, lat2, lon2, screenshot);
+
+        int argi = 2;
+        double lat1 = atof(argv[argi++]);
+        double lon1 = atof(argv[argi++]);
+        double heightFt1 = 0.0;
+        if (argi < argc && argv[argi][0] == '+') heightFt1 = atof(argv[argi++]);
+
+        if (argi + 1 >= argc) {
+            fprintf(stderr, usage, argv[0]);
+            return 1;
+        }
+        double lat2 = atof(argv[argi++]);
+        double lon2 = atof(argv[argi++]);
+        double heightFt2 = 0.0;
+        if (argi < argc && argv[argi][0] == '+') heightFt2 = atof(argv[argi++]);
+
+        const char *screenshot = (argi < argc) ? argv[argi] : getenv("TV_SCREENSHOT");
+        return RunProfileMode(lat1, lon1, heightFt1, lat2, lon2, heightFt2, screenshot);
     }
 
     LoadDefaultDtmSet();
