@@ -51,12 +51,40 @@ RUNNING -- walkthrough mode:
     ./terrain_viewer [cody|meeteetse|bighorn]
 
 Defaults to `cody`. WASD to move, Shift to sprint, mouse to look around
-(pitch clamped to +/-89 degrees), Esc to quit. The terrain is a single
-~1.8km-square heightfield window centered on you, rebuilt (not every frame)
-once you've walked far enough from its center -- see KNOWN LIMITATIONS
-below. It's shaded by an elevation color ramp (dark green low, tan mid,
-white near the top of whatever range the current window spans) since no
-orthophoto imagery is loaded.
+(pitch clamped to +/-89 degrees), Esc to quit. It's shaded by an elevation
+color ramp (dark green low, tan mid, white near the top of whatever range
+the current window spans) since no orthophoto imagery is loaded.
+
+The terrain is one regenerable heightfield window, rebuilt (not every
+frame) once you've walked far enough from its center or turned more than
+~20 degrees from the facing it was last built for. Its shape and extent
+are visibility-driven, not a fixed size: `ComputeVisibleDistanceKm` in
+`terrain_viewer.c` ray-marches out from the camera along several bearings
+across your current facing (plus two more to each side), using the same
+Earth-curvature-and-refraction model as `--profile` mode's sightline, to
+find how far anything could actually be *seen* in that direction -- capped
+by the horizon curvature itself, or by a nearer ridge poking up and
+blocking the rest, whichever comes first (hard-capped at 20km regardless,
+past which the fixed vertex budget is too coarse to be worth extending
+further). The window is built oriented to that facing, wide/deep in front
+of you and only a small fixed margin behind, with vertex density and DTM
+pyramid level both graded by distance from the camera (dense/full-res
+near, sparse/coarse far) -- so how much DTM data actually gets touched
+tracks what's genuinely visible: standing in the open Bighorn Basin
+looking down its length reaches on the order of 10-15km, while facing
+straight into a nearby slope on the Bighorn tile drops to a few hundred
+meters. The bottom HUD line reports the current window's computed ahead/
+side extents.
+
+DTM pixel data is memory-mapped, not read via ordinary file I/O -- but not
+by anything in this project's own code: libtiff's default `TIFFOpen(path,
+"r")` already `mmap()`s the whole file at open time (confirmed with
+`strace`: one `mmap()` of the entire multi-GB file, zero further `read`/
+`pread` calls afterward), so tile decompression already pulls compressed
+bytes straight out of that mapping, lazily faulting in pages from disk
+only as tiles are actually touched -- the same "mmap once, let the OS
+handle residency" idea as `kdtree`'s own shard files, just arrived at via
+libtiff's own defaults rather than anything explicit in `dtm.c`.
 
 `TV_LAT`/`TV_LON` override the starting point; `TV_SCREENSHOT` (a filename)
 plus `TV_SCREENSHOT_FRAME` (a frame count, default 30) take a screenshot
@@ -86,10 +114,17 @@ leaves Wyoming.
 KNOWN LIMITATIONS (deliberate v1 scope, not oversights):
 
 - The walkthrough is one regenerable heightfield window, not a proper
-  multi-ring clipmap -- there's a small pop when it rebuilds, and no
-  distant low-res terrain silhouette beyond the window's edge (you see sky
-  past ~900m). Good enough to "stand on the surface and look around"; a
-  clipmap would be the natural next step if the pop-in becomes annoying.
+  multi-ring clipmap -- there's a small pop when it rebuilds. Good enough
+  to "stand on the surface and look around"; a clipmap (or caching more
+  than one window so a rebuild reuses recently-seen terrain instead of
+  resampling it) would be the natural next step if the pop-in becomes
+  annoying.
+- The visibility ray march decides how *far* to extend geometry in a
+  direction, not which interior points to skip -- a distant peak poking
+  over a closer ridge correctly extends that direction's render distance,
+  but the hidden valley in between still gets drawn (it's one continuous
+  heightfield mesh, not a masked one). An actual occlusion mask would need
+  irregular mesh topology or a ray-marched/voxel renderer.
 - No orthophoto texture (elevation-ramp shading only), except that
   `hillshade_W109N44_Deg_Cog.tif` (already present alongside the Cody DTM
   on the development machine) is a candidate texture for that one tile

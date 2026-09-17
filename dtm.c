@@ -232,6 +232,19 @@ int DtmSetAddFile(DtmSet *set, const char *path) {
         return -1;
     }
 
+    /* No explicit mmap call here on purpose: this "r" mode (as opposed to
+     * "rm") already gets one from libtiff itself. On Unix, TIFFOpen's
+     * default client mmaps the ENTIRE file read-only the moment it's
+     * opened, and TIFFReadEncodedTile (in GetTile below) reads compressed
+     * tile bytes straight out of that mapping rather than calling
+     * read()/pread() -- confirmed with strace against a live 4.4GB DTM
+     * file (one mmap() of the whole file at TIFFOpen time, then zero
+     * further read/pread syscalls on that fd for the rest of the run).
+     * That mapping is lazy at the OS page-cache level exactly the way
+     * kdtree's own mmap'd shard files are: opening reserves address
+     * space, but pages only fault in from disk as tiles are actually
+     * touched. Do NOT "fix" this by adding a second, redundant explicit
+     * mmap layer -- there's nothing for it to improve on. */
     TIFF *tiff = TIFFOpen(path, "r");
     if (!tiff) {
         fprintf(stderr, "dtm: couldn't open %s\n", path);

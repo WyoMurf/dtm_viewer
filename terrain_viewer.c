@@ -46,6 +46,21 @@ static const char *kDefaultDtmPaths[] = {
 
 static DtmSet g_dtm = { 0 };
 
+#define EYE_HEIGHT_M 1.7f
+#define WALK_SPEED_MPS 4.0f
+#define SPRINT_MULT 3.0f
+#define MOUSE_SENSITIVITY 0.12f
+
+/* Smallest signed difference b-a, in degrees, wrapped to (-180, 180] --
+ * for comparing two yaw angles that both accumulate unbounded (mouse-look
+ * just adds/subtracts degrees with no wraparound) without a 359-vs-1
+ * comparison reading as a huge turn. */
+static float AngleDiffDeg(float a, float b) {
+    float d = fmodf(b - a + 180.0f, 360.0f);
+    if (d < 0) d += 360.0f;
+    return d - 180.0f;
+}
+
 /* --- Gribb-Hartmann frustum extraction, verbatim from earth_viewer.c/viewer.c --- */
 typedef struct { float a, b, c, d; } Plane;
 static void ExtractFrustumPlanes(Matrix m, Plane out[6]) {
@@ -59,11 +74,85 @@ static void ExtractFrustumPlanes(Matrix m, Plane out[6]) {
 
 /* --- Terrain window: one regenerable heightfield mesh centered on wherever
  * the camera last was when it was (re)built. Not a multi-ring clipmap --
- * see README-terrain.md's known-limitations note -- just one square,
- * rebuilt whenever the camera has wandered far enough from its center. --- */
-#define TERRAIN_HALF_SIZE_M 900.0f   /* window covers a ~1.8km square */
+ * see README-terrain.md's known-limitations note -- rebuilt whenever the
+ * camera has wandered far enough from its center, OR turned far enough
+ * from the facing direction it was last built for (see below: the
+ * window's shape now depends on which way you're looking, not just where
+ * you are). --- */
 #define TERRAIN_RESOLUTION 240       /* 241x241 vertices = 58,081, under raylib's 65536-per-mesh index limit */
 #define TERRAIN_REBUILD_THRESHOLD_M 300.0f /* rebuild once the camera is this far from the window's center */
+#define TERRAIN_REBUILD_YAW_DEG 20.0f       /* ...or turned this many degrees from the window's build-time facing */
+#define TERRAIN_BEHIND_M 250.0f      /* fixed, small, NOT ray-marched -- see ComputeVisibleDistanceKm's comment */
+#define TERRAIN_MIN_EXTENT_M 200.0f  /* floor on forward/side extent so the window is never degenerately small */
+
+/* Earth-curvature/refraction horizon-visibility model, shared with
+ * ComputeVisibleDistanceKm below and RunProfileMode's sightline plot --
+ * see the latter for the derivation (textbook ITU-R P.526-style bulge). */
+#define VISIBILITY_REFRACTION_K (4.0 / 3.0)
+#define VISIBILITY_MAX_ELEV_M 4500.0    /* headroom over the Bighorn tile's known ~4013m max -- see README.md */
+#define VISIBILITY_MAX_RANGE_KM 20.0    /* hard ceiling: matches rlSetClipPlanes' far plane, and beyond this TERRAIN_RESOLUTION vertices is too coarse to bother */
+
+/* Horizon-silhouette ray march along one compass bearing from
+ * (camLat,camLon): how far out, in this direction, could anything loaded
+ * actually be SEEN from an eye at eyeElevM (absolute elevation, meters),
+ * given Earth's curvature, standard atmospheric refraction, and whatever
+ * terrain relief actually exists along the way? This is exactly
+ * "lazily depending on view direction, curvature, and intervening
+ * obstacles" -- the caller uses the returned distance to decide how far
+ * to extend the terrain mesh (and therefore how much DTM data actually
+ * gets sampled/touched) in that direction, instead of always building a
+ * fixed-size window regardless of what's actually visible.
+ *
+ * Uses the same curvature+refraction model as RunProfileMode's sightline
+ * (destination_point, the d1*d2/(2*k*R) bulge term) but as a
+ * single-observer running-max-angle horizon check rather than a
+ * two-endpoint chord: a sample at distance d is "visible" only if its
+ * curvature-corrected elevation angle beats every closer sample's --
+ * otherwise a nearer ridge (or Earth's own curvature) hides it. */
+static double ComputeVisibleDistanceKm(double camLat, double camLon, double eyeElevM, double bearingDeg) {
+    double effectiveRadiusM = EARTH_RADIUS_KM * VISIBILITY_REFRACTION_K * 1000.0;
+    double maxAngle = -1e18;
+    double lastVisibleKm = 0.05; /* always at least a little ground right around the camera */
+
+    for (double d = 0.05; d < VISIBILITY_MAX_RANGE_KM; d *= 1.4) {
+        double dM = d * 1000.0;
+
+        /* Bound check: even the tallest elevation anywhere in the loaded
+         * DTMs can no longer beat maxAngle at this distance -- the
+         * curvature penalty term only grows with distance, so once the
+         * best possible case falls behind, nothing farther can ever catch
+         * back up. Stop the ray here rather than sampling (and thus
+         * touching/paging in) DTM data that provably couldn't be seen. */
+        double boundAngle = (VISIBILITY_MAX_ELEV_M - eyeElevM) / dM - dM / (2.0 * effectiveRadiusM);
+        if (boundAngle < maxAngle) break;
+
+        double lat, lon;
+        destination_point(camLat, camLon, bearingDeg, d, EARTH_RADIUS_KM, &lat, &lon);
+        int level = d < 2.0 ? 0 : d < 8.0 ? 2 : 4; /* coarser DTM pyramid level for farther, cheaper samples -- same idea RunProfileMode uses */
+        double m = DtmSampleMeters(&g_dtm, lat, lon, level);
+        if (m == DTM_NODATA) break; /* no more loaded data exists this direction */
+
+        double angle = (m - eyeElevM) / dM - dM / (2.0 * effectiveRadiusM);
+        if (angle > maxAngle) {
+            maxAngle = angle;
+            lastVisibleKm = d;
+        }
+    }
+    return lastVisibleKm;
+}
+
+/* Max of ComputeVisibleDistanceKm over several bearings, in meters --
+ * used to size the terrain window's forward extent (a fan of bearings
+ * across the camera's facing) and its side extent (bearings at +/-90). */
+static float MaxVisibleExtentM(double camLat, double camLon, double eyeElevM, const double *bearingsDeg, int count) {
+    double maxKm = 0.0;
+    for (int i = 0; i < count; i++) {
+        double km = ComputeVisibleDistanceKm(camLat, camLon, eyeElevM, bearingsDeg[i]);
+        if (km > maxKm) maxKm = km;
+    }
+    float m = (float)(maxKm * 1000.0);
+    return m < TERRAIN_MIN_EXTENT_M ? TERRAIN_MIN_EXTENT_M : m;
+}
 
 typedef struct {
     Mesh mesh;
@@ -71,6 +160,8 @@ typedef struct {
     int built;
     double centerLat, centerLon; /* the (lat,lon) this window's local (0,0) corresponds to */
     float centerX, centerZ;      /* that same center, in the walk's own local-meters frame */
+    float yaw;                   /* the facing this window's shape was built for -- see TERRAIN_REBUILD_YAW_DEG */
+    float forwardM, sideM;       /* last computed visibility extents, for the HUD -- see MaxVisibleExtentM */
 } TerrainWindow;
 
 /* Elevation color ramp -- no orthophoto imagery is available, so terrain is
@@ -99,8 +190,16 @@ static Color ElevationColor(float t) { /* t in [0,1] */
     };
 }
 
+/* Per-vertex working data for the two-pass mesh build below -- position
+ * (already the mesh's own final local x/z, before the center translate
+ * applied at draw time) plus height, so the second pass can compute real
+ * normals from actual neighbor positions instead of assuming a uniform,
+ * axis-aligned grid spacing (no longer true now that the window is
+ * yaw-oriented and non-uniformly warped along its forward axis). */
+typedef struct { float x, z, h; } TerrainVert;
+
 static void BuildTerrainWindow(TerrainWindow *tw, double originLat, double originLon,
-                                double centerLat, double centerLon, double originElevation) {
+                                double centerLat, double centerLon, double originElevation, float yawDeg) {
     if (tw->built) UnloadMesh(tw->mesh);
 
     int res = TERRAIN_RESOLUTION;
@@ -123,19 +222,79 @@ static void BuildTerrainWindow(TerrainWindow *tw, double originLat, double origi
     double centerEastM, centerNorthM;
     DtmLonLatToLocalMeters(originLat, originLon, centerLat, centerLon, &centerEastM, &centerNorthM);
 
-    float *heights = malloc(sizeof(float) * (size_t)vertexCount);
+    /* Eye elevation at the window's center, for the visibility ray march --
+     * falls back to the walk's starting elevation if this exact point
+     * happens to be NODATA (shouldn't normally happen, since it's wherever
+     * the camera currently is). */
+    double centerElevM = DtmSampleMeters(&g_dtm, centerLat, centerLon, 0);
+    double eyeElevM = (centerElevM == DTM_NODATA ? originElevation : centerElevM) + EYE_HEIGHT_M;
+
+    /* Forward/right unit vectors in world (x,z), rotated by yawDeg -- same
+     * convention as WalkForward/UpdateWalkCamera's strafe direction (right
+     * = normalize(cross(flatForward, worldUp))), so "ahead" here always
+     * matches whichever way the camera is actually facing. */
+    float yr = yawDeg * DEG2RAD;
+    float fwdX = sinf(yr), fwdZ = -cosf(yr);
+    float rightX = cosf(yr), rightZ = sinf(yr);
+
+    double forwardBearings[5] = { yawDeg - 40.0, yawDeg - 20.0, yawDeg, yawDeg + 20.0, yawDeg + 40.0 };
+    double sideBearings[2] = { yawDeg - 90.0, yawDeg + 90.0 };
+    float forwardM = MaxVisibleExtentM(centerLat, centerLon, eyeElevM, forwardBearings, 5);
+    float sideM = MaxVisibleExtentM(centerLat, centerLon, eyeElevM, sideBearings, 2);
+    float behindM = TERRAIN_BEHIND_M; /* fixed, not ray-marched -- see ComputeVisibleDistanceKm's comment header */
+
+    /* Forward axis (index i) is split into a small uniform "behind" run and
+     * a quadratically-warped "ahead" run -- dense near the camera (i just
+     * past the behind section), sparse out toward forwardM -- so the fixed
+     * TERRAIN_RESOLUTION vertex budget still gives good close-up detail
+     * even when forwardM is many kilometers on a clear, unobstructed view.
+     * Side axis (index j) stays uniformly spaced; sideM is much smaller. */
+    int behindVerts = vertsPerSide / 8;
+    if (behindVerts < 2) behindVerts = 2;
+    int aheadVerts = vertsPerSide - behindVerts;
+
+    TerrainVert *verts = malloc(sizeof(TerrainVert) * (size_t)vertexCount);
     float minH = 1e9f, maxH = -1e9f;
-    double step = (2.0 * TERRAIN_HALF_SIZE_M) / res;
 
     for (int j = 0; j < vertsPerSide; j++) {
-        double localNorth = centerNorthM + (-TERRAIN_HALF_SIZE_M + j * step);
+        float sideOffset = -sideM + (float)j * (2.0f * sideM / res);
         for (int i = 0; i < vertsPerSide; i++) {
-            double localEast = centerEastM + (-TERRAIN_HALF_SIZE_M + i * step);
+            float alongForward;
+            if (i < behindVerts) {
+                alongForward = -behindM + (float)i * (behindM / (behindVerts - 1));
+            } else {
+                float k = (float)(i - behindVerts) / (float)(aheadVerts - 1);
+                alongForward = forwardM * k * k;
+            }
+
+            float x = fwdX * alongForward + rightX * sideOffset;
+            float z = fwdZ * alongForward + rightZ * sideOffset;
+
+            /* z is a world-Z offset, which per the file header convention
+             * means south -- so it maps to DECREASING northM, the same
+             * negation UpdateWalkCamera/the rebuild trigger apply via
+             * `-wc->position.z`. See the bug this fixed: a from-scratch
+             * reader might reasonably add rather than subtract here, which
+             * silently samples each vertex's height from the north-south
+             * MIRROR of where it actually sits in world space. */
+            double localEast = centerEastM + x;
+            double localNorth = centerNorthM - z;
             double lat, lon;
             DtmLocalMetersToLonLat(originLat, originLon, localEast, localNorth, &lat, &lon);
-            double m = DtmSampleMeters(&g_dtm, lat, lon, 0);
+
+            /* Coarser DTM pyramid level for vertices far from the camera --
+             * consistent with ComputeVisibleDistanceKm's own level choice,
+             * and another concrete way the amount of DTM data actually
+             * touched now tracks what's genuinely resolvable at that
+             * distance rather than always reading full resolution. */
+            float radialDist = sqrtf(x * x + z * z);
+            int level = radialDist < 200.0f ? 0 : radialDist < 1000.0f ? 1 : radialDist < 4000.0f ? 2 : radialDist < 10000.0f ? 3 : 4;
+
+            double m = DtmSampleMeters(&g_dtm, lat, lon, level);
             float h = (m == DTM_NODATA) ? 0.0f : (float)(m - originElevation);
-            heights[j * vertsPerSide + i] = h;
+
+            TerrainVert *tv = &verts[j * vertsPerSide + i];
+            tv->x = x; tv->z = z; tv->h = h;
             if (h < minH) minH = h;
             if (h > maxH) maxH = h;
         }
@@ -144,27 +303,33 @@ static void BuildTerrainWindow(TerrainWindow *tw, double originLat, double origi
 
     int v = 0;
     for (int j = 0; j < vertsPerSide; j++) {
-        float z = (float)(-TERRAIN_HALF_SIZE_M + j * step); /* south is +Z, see file header comment */
         for (int i = 0; i < vertsPerSide; i++) {
-            float x = (float)(-TERRAIN_HALF_SIZE_M + i * step);
-            float h = heights[j * vertsPerSide + i];
-            mesh.vertices[v * 3 + 0] = x;
-            mesh.vertices[v * 3 + 1] = h;
-            mesh.vertices[v * 3 + 2] = z;
+            TerrainVert *tv = &verts[j * vertsPerSide + i];
+            mesh.vertices[v * 3 + 0] = tv->x;
+            mesh.vertices[v * 3 + 1] = tv->h;
+            mesh.vertices[v * 3 + 2] = tv->z;
 
-            /* Normal from central differences, clamped to the window edge
-             * (one-sided difference there) -- good enough for lighting a
-             * heightfield, no need for the exact analytic surface normal. */
+            /* Normal from actual neighbor positions (central differences,
+             * one-sided at the window's edges) -- the grid is no longer
+             * uniformly spaced or world-axis-aligned, so the old shortcut
+             * (assume a constant "step" in both x and z) no longer applies;
+             * this version works for any grid shape. Cross order verified
+             * to give a +Y (up) normal for flat terrain, matching
+             * rightDir x forwardDir = +Y (since forwardDir x rightDir =
+             * forwardDir x (forwardDir x up) = -up by the vector triple
+             * product identity, as forwardDir.up = 0). */
             int iL = i > 0 ? i - 1 : i, iR = i < res ? i + 1 : i;
             int jU = j > 0 ? j - 1 : j, jD = j < res ? j + 1 : j;
-            float hL = heights[j * vertsPerSide + iL], hR = heights[j * vertsPerSide + iR];
-            float hU = heights[jU * vertsPerSide + i], hD = heights[jD * vertsPerSide + i];
-            Vector3 n = Vector3Normalize((Vector3){ hL - hR, 2.0f * (float)step, hU - hD });
+            TerrainVert *tL = &verts[j * vertsPerSide + iL], *tR = &verts[j * vertsPerSide + iR];
+            TerrainVert *tU = &verts[jU * vertsPerSide + i], *tD = &verts[jD * vertsPerSide + i];
+            Vector3 tangentI = { tR->x - tL->x, tR->h - tL->h, tR->z - tL->z };
+            Vector3 tangentJ = { tD->x - tU->x, tD->h - tU->h, tD->z - tU->z };
+            Vector3 n = Vector3Normalize(Vector3CrossProduct(tangentJ, tangentI));
             mesh.normals[v * 3 + 0] = n.x;
             mesh.normals[v * 3 + 1] = n.y;
             mesh.normals[v * 3 + 2] = n.z;
 
-            Color c = ElevationColor((h - minH) / (maxH - minH));
+            Color c = ElevationColor((tv->h - minH) / (maxH - minH));
             mesh.colors[v * 4 + 0] = c.r;
             mesh.colors[v * 4 + 1] = c.g;
             mesh.colors[v * 4 + 2] = c.b;
@@ -172,7 +337,7 @@ static void BuildTerrainWindow(TerrainWindow *tw, double originLat, double origi
             v++;
         }
     }
-    free(heights);
+    free(verts);
 
     int idx = 0;
     for (int j = 0; j < res; j++) {
@@ -194,6 +359,9 @@ static void BuildTerrainWindow(TerrainWindow *tw, double originLat, double origi
     tw->centerLon = centerLon;
     tw->centerX = (float)centerEastM;
     tw->centerZ = (float)centerNorthM;
+    tw->yaw = yawDeg;
+    tw->forwardM = forwardM;
+    tw->sideM = sideM;
 }
 
 /* --- Walk mode --- */
@@ -202,11 +370,6 @@ typedef struct {
     Vector3 position; /* world meters, relative to walk origin */
     float yaw, pitch;  /* degrees */
 } WalkCamera;
-
-#define EYE_HEIGHT_M 1.7f
-#define WALK_SPEED_MPS 4.0f
-#define SPRINT_MULT 3.0f
-#define MOUSE_SENSITIVITY 0.12f
 
 static Vector3 WalkForward(const WalkCamera *wc) {
     float yr = wc->yaw * DEG2RAD, pr = wc->pitch * DEG2RAD;
@@ -269,7 +432,7 @@ static int RunWalkMode(double startLat, double startLon) {
     wc.pitch = getenv("TV_PITCH") ? (float)atof(getenv("TV_PITCH")) : -5.0f;
 
     TerrainWindow terrain = { 0 };
-    BuildTerrainWindow(&terrain, originLat, originLon, originLat, originLon, originElevation);
+    BuildTerrainWindow(&terrain, originLat, originLon, originLat, originLon, originElevation, wc.yaw);
 
     Camera3D camera = { 0 };
     camera.fovy = 70.0f;
@@ -289,10 +452,12 @@ static int RunWalkMode(double startLat, double startLon) {
         UpdateWalkCamera(&wc, originLat, originLon, originElevation, dt);
 
         float dx = wc.position.x - terrain.centerX, dz = wc.position.z - terrain.centerZ;
-        if (sqrtf(dx * dx + dz * dz) > TERRAIN_REBUILD_THRESHOLD_M) {
+        int movedTooFar = sqrtf(dx * dx + dz * dz) > TERRAIN_REBUILD_THRESHOLD_M;
+        int turnedTooFar = fabsf(AngleDiffDeg(terrain.yaw, wc.yaw)) > TERRAIN_REBUILD_YAW_DEG;
+        if (movedTooFar || turnedTooFar) {
             double lat, lon;
             DtmLocalMetersToLonLat(originLat, originLon, wc.position.x, -wc.position.z, &lat, &lon);
-            BuildTerrainWindow(&terrain, originLat, originLon, lat, lon, originElevation);
+            BuildTerrainWindow(&terrain, originLat, originLon, lat, lon, originElevation, wc.yaw);
         }
 
         camera.position = wc.position;
@@ -318,6 +483,7 @@ static int RunWalkMode(double startLat, double startLon) {
             DtmLocalMetersToLonLat(originLat, originLon, wc.position.x, -wc.position.z, &lat, &lon);
             double elev = wc.position.y - EYE_HEIGHT_M + originElevation;
             DrawText(TextFormat("lat=%.5f  lon=%.5f  elev=%.1fm  yaw=%.0f pitch=%.0f", lat, lon, elev, wc.yaw, wc.pitch), 10, 35, 18, RAYWHITE);
+            DrawText(TextFormat("visible range: %.0fm ahead, %.0fm to the sides (curvature/obstacle-limited)", terrain.forwardM, terrain.sideM), 10, 58, 16, RAYWHITE);
         }
         DrawText("WASD move, Shift sprint, mouse look, Esc to quit", 10, GetScreenHeight() - 30, 14, SKYBLUE);
         EndDrawing();
