@@ -1,0 +1,4 @@
+*.o
+dtm_test
+terrain_viewer
+*.png

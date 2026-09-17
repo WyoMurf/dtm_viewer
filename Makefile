@@ -1,0 +1,30 @@
+.PHONY: clean
+
+CC = gcc
+CFLAGS = -std=c11 -g -Wall -Wno-unused -fPIC
+LDFLAGS = -lm
+
+# Machine-specific path to a locally-built raylib checkout (needed only for
+# `terrain_viewer`, not `dtm_test`) -- see README.md.
+RAYLIB_DIR = /home/murf/external-sources/raylib/src
+
+geo_utils.o: geo_utils.c include/geo_utils.h
+	$(CC) $(CFLAGS) -Iinclude -c geo_utils.c -o $@
+
+dtm.o: dtm.c include/dtm.h
+	$(CC) $(CFLAGS) -Iinclude -c dtm.c -o $@
+
+# Standalone sanity check for dtm.c/dtm.h, with no raylib dependency --
+# point it at one or more DTM GeoTIFFs and it prints elevation at a few
+# known lat/lon probes plus a coarse per-file min/max scan. See README.md.
+dtm_test: dtm.c include/dtm.h
+	$(CC) $(CFLAGS) -std=gnu11 -O2 -DDTM_TEST -Iinclude dtm.c -o $@ -ltiff -lm
+
+# -O3 matters a lot here: at -O0, raymath.h's Vector3* helpers don't get
+# inlined despite being declared `static inline`, costing real per-frame CPU
+# in the terrain/profile render loops.
+terrain_viewer: terrain_viewer.c include/dtm.h include/geo_utils.h geo_utils.o dtm.o
+	$(CC) $(CFLAGS) -std=gnu11 -O3 terrain_viewer.c geo_utils.o dtm.o -o $@ -Iinclude -I$(RAYLIB_DIR) -L$(RAYLIB_DIR) -Wl,-rpath,$(RAYLIB_DIR) -lraylib -lGL -lm -lpthread -ldl -lrt -lX11 -ltiff
+
+clean:
+	rm -f geo_utils.o dtm.o dtm_test terrain_viewer
