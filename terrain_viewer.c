@@ -114,9 +114,9 @@ static void ExtractFrustumPlanes(Matrix m, Plane out[6]) {
  * from the facing direction it was last built for (see below: the
  * window's shape now depends on which way you're looking, not just where
  * you are). --- */
-#define TERRAIN_RESOLUTION 240       /* 241x241 vertices = 58,081, under raylib's 65536-per-mesh index limit */
-#define TERRAIN_REBUILD_THRESHOLD_M 300.0f /* rebuild once the camera is this far from the window's center */
-#define TERRAIN_REBUILD_YAW_DEG 20.0f       /* ...or turned this many degrees from the window's build-time facing */
+#define TERRAIN_RESOLUTION 254       /* 255x255 vertices = 65,025, just under raylib's 65536-per-mesh index limit */
+#define TERRAIN_REBUILD_MARGIN 0.55f /* rebuild once the camera has covered this fraction of the window's own extent in some direction -- see the rebuild-trigger comment in RunWalkMode for why a fixed distance isn't safe here */
+#define TERRAIN_REBUILD_YAW_DEG 60.0f /* ...or turned this many degrees from the window's build-time facing. Larger than you might expect: a full rebuild resamples the whole window (see the side-axis warp comment below), and rebuilding on every modest turn was itself the main cause of a distant peak's rendered shape visibly shifting while just panning across it. */
 #define TERRAIN_BEHIND_M 250.0f      /* fixed, small, NOT ray-marched -- see ComputeVisibleDistanceKm's comment */
 #define TERRAIN_MIN_EXTENT_M 200.0f  /* floor on forward/side extent so the window is never degenerately small */
 
@@ -198,6 +198,30 @@ typedef struct {
     float yaw;                   /* the facing this window's shape was built for -- see TERRAIN_REBUILD_YAW_DEG */
     float forwardM, sideM;       /* last computed visibility extents, for the HUD -- see MaxVisibleExtentM */
 } TerrainWindow;
+
+/* Whether the camera has strayed close enough to this window's own actual
+ * boundary (in whichever direction) to need a rebuild -- NOT simply "moved
+ * more than a fixed distance from center". The window's forward/side
+ * extents are themselves visibility-driven (see BuildTerrainWindow) and
+ * can be much smaller than any fixed threshold -- e.g. ~500m facing
+ * straight into a nearby slope -- so a fixed-distance trigger can let the
+ * camera walk right off the edge of a small window before ever
+ * triggering, which is exactly what "walking forward and seeing under the
+ * map" turned out to be: the window's edge, not a hole in it. */
+static int TerrainWindowNeedsRebuild(const TerrainWindow *tw, Vector3 camPos, float camYaw) {
+    float dx = camPos.x - tw->centerX, dz = camPos.z - tw->centerZ;
+    float tyr = tw->yaw * DEG2RAD;
+    float tFwdX = sinf(tyr), tFwdZ = -cosf(tyr);
+    float tRightX = cosf(tyr), tRightZ = sinf(tyr);
+    float alongForward = dx * tFwdX + dz * tFwdZ;
+    float alongSide = dx * tRightX + dz * tRightZ;
+
+    if (alongForward > tw->forwardM * TERRAIN_REBUILD_MARGIN) return 1;
+    if (alongForward < -TERRAIN_BEHIND_M * TERRAIN_REBUILD_MARGIN) return 1;
+    if (fabsf(alongSide) > tw->sideM * TERRAIN_REBUILD_MARGIN) return 1;
+    if (fabsf(AngleDiffDeg(tw->yaw, camYaw)) > TERRAIN_REBUILD_YAW_DEG) return 1;
+    return 0;
+}
 
 /* Elevation color ramp -- no orthophoto imagery is available, so terrain is
  * shaded by height: dark green low, tan/brown mid, white near the top of
@@ -283,7 +307,16 @@ static void BuildTerrainWindow(TerrainWindow *tw, double originLat, double origi
      * past the behind section), sparse out toward forwardM -- so the fixed
      * TERRAIN_RESOLUTION vertex budget still gives good close-up detail
      * even when forwardM is many kilometers on a clear, unobstructed view.
-     * Side axis (index j) stays uniformly spaced; sideM is much smaller. */
+     * Side axis (index j) is warped the same way, symmetrically about
+     * sideOffset=0 (dense near the camera's own line of travel, sparse out
+     * toward +/-sideM) -- it used to be uniformly spaced, which gave a
+     * distant feature a noticeably different vertex density (and therefore
+     * a different simplified silhouette) depending on whether it currently
+     * fell under the forward axis's warp or the side axis's uniform
+     * spacing -- e.g. a mountain visibly changing shape as you panned it
+     * from "ahead" to "off to the side". Matching both axes' density
+     * falloff makes a given distant point's approximation far more
+     * consistent regardless of which direction it's in. */
     int behindVerts = vertsPerSide / 8;
     if (behindVerts < 2) behindVerts = 2;
     int aheadVerts = vertsPerSide - behindVerts;
@@ -292,7 +325,8 @@ static void BuildTerrainWindow(TerrainWindow *tw, double originLat, double origi
     float minH = 1e9f, maxH = -1e9f;
 
     for (int j = 0; j < vertsPerSide; j++) {
-        float sideOffset = -sideM + (float)j * (2.0f * sideM / res);
+        float sj = (float)j / res * 2.0f - 1.0f; /* -1..+1 */
+        float sideOffset = (sj < 0 ? -1.0f : 1.0f) * sideM * sj * sj;
         for (int i = 0; i < vertsPerSide; i++) {
             float alongForward;
             if (i < behindVerts) {
@@ -491,10 +525,7 @@ static int RunWalkMode(double startLat, double startLon) {
         float dt = GetFrameTime();
         UpdateWalkCamera(&wc, originLat, originLon, originElevation, dt);
 
-        float dx = wc.position.x - terrain.centerX, dz = wc.position.z - terrain.centerZ;
-        int movedTooFar = sqrtf(dx * dx + dz * dz) > TERRAIN_REBUILD_THRESHOLD_M;
-        int turnedTooFar = fabsf(AngleDiffDeg(terrain.yaw, wc.yaw)) > TERRAIN_REBUILD_YAW_DEG;
-        if (movedTooFar || turnedTooFar) {
+        if (TerrainWindowNeedsRebuild(&terrain, wc.position, wc.yaw)) {
             double lat, lon;
             DtmLocalMetersToLonLat(originLat, originLon, wc.position.x, -wc.position.z, &lat, &lon);
             BuildTerrainWindow(&terrain, originLat, originLon, lat, lon, originElevation, wc.yaw);

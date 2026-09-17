@@ -133,6 +133,28 @@ KNOWN LIMITATIONS (deliberate v1 scope, not oversights):
   than one window so a rebuild reuses recently-seen terrain instead of
   resampling it) would be the natural next step if the pop-in becomes
   annoying.
+- A distant feature's rendered silhouette can still shift slightly between
+  rebuilds -- every rebuild resamples the whole window (including far
+  vertices) from scratch, at a coarse DTM pyramid level, through a sparse,
+  yaw-rotated vertex grid, so the exact points sampled along, say, a
+  faraway ridgeline aren't identical from one rebuild to the next. The
+  side-axis warp (symmetric now, matching the forward axis -- see
+  `BuildTerrainWindow`) and a larger yaw-triggered rebuild threshold
+  (`TERRAIN_REBUILD_YAW_DEG`, 60 rather than 20) cut this down a lot --
+  scanning across a peak now shifts it smoothly across frame rather than
+  visibly reshaping it -- but a fully stable distant skyline would need a
+  separate, far-terrain representation that persists across near-window
+  rebuilds instead of being resampled by them (e.g. a cached horizon strip
+  built from the same per-bearing ray march `ComputeVisibleDistanceKm`
+  already does), which is a bigger change than this pass made.
+- The rebuild trigger compares the camera's position against the
+  *current* window's own forward/side/behind extents (a fixed fraction of
+  each, `TERRAIN_REBUILD_MARGIN`), not a flat distance -- important because
+  those extents are themselves visibility-driven and can be much smaller
+  than a fixed threshold would assume (e.g. ~500m facing straight into a
+  slope). A flat-distance trigger let the camera walk past a small
+  window's real edge before ever rebuilding, which looked like "the
+  ground disappears and I can see under the map."
 - The visibility ray march decides how *far* to extend geometry in a
   direction, not which interior points to skip -- a distant peak poking
   over a closer ridge correctly extends that direction's render distance,
