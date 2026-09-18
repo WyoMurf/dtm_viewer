@@ -204,6 +204,37 @@ resolution) that rasterizes every sample as it's computed, rather than
 just the farthest visible point. Runs in under 2 seconds even at a 20km
 radius against the full DTM set.
 
+SCOUTING TOOLS (`make probe_points los_check`):
+
+Two small headless helpers (no raylib, no window) for batch terrain
+scouting -- e.g. searching many candidate sites at once for something like
+a passive RF reflector location, rather than checking points one at a time
+in `--profile`. Both read lines from stdin and print one result line per
+input line, so they're meant to be driven by a generated grid of points
+(a short script looping over `geo_utils.h`'s `destination_point` math, or
+any other source of lat/lon pairs) rather than typed by hand.
+
+    ./probe_points file.tif [file.tif ...]
+
+Reads `lat,lon` per line, prints `lat,lon,elevM` (or `DTM_NODATA`'s
+sentinel value if outside coverage). Just a bare elevation lookup -- useful
+for finding local high points or low saddles in a region before checking
+which ones actually have useful sightlines.
+
+    ./los_check file.tif [file.tif ...]
+
+Reads `lat1,lon1,h1ft,lat2,lon2,h2ft` per line (h in feet above ground at
+each point, matching `--profile`'s `+heightFt` convention), prints
+`lat1,lon1,lat2,lon2,CLEAR,marginM` or `...,BLOCKED,marginM,atKm` --
+reuses the exact same curvature/refraction sightline math `--profile`
+plots (worst point along the path relative to the direct line, not just a
+single-obstruction check), just without opening a window per pair, so
+hundreds of candidate pairs can be tested in well under a second. This is
+how the two-tower/five-point Meeteetse reflector-site search was actually
+done: generate a grid of candidate points, batch-test all of them against
+the towers and the target addresses with `los_check`, then confirm the
+winner visually with a real `--profile` screenshot before trusting it.
+
 KNOWN LIMITATIONS (deliberate v1 scope, not oversights):
 
 - The walkthrough is one regenerable heightfield window, not a proper

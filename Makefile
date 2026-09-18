@@ -26,5 +26,15 @@ dtm_test: dtm.c include/dtm.h
 terrain_viewer: terrain_viewer.c include/dtm.h include/geo_utils.h geo_utils.o dtm.o
 	$(CC) $(CFLAGS) -std=gnu11 -O3 terrain_viewer.c geo_utils.o dtm.o -o $@ -Iinclude -I$(RAYLIB_DIR) -L$(RAYLIB_DIR) -Wl,-rpath,$(RAYLIB_DIR) -lraylib -lGL -lm -lpthread -ldl -lrt -lX11 -ltiff
 
+# Headless terrain-scouting helpers, no raylib dependency -- see README.md's
+# SCOUTING TOOLS section. Both read points from stdin so they're easy to
+# drive from a generated grid (e.g. a small Python destination_point loop)
+# without opening a window per point.
+probe_points: probe_points.c include/dtm.h dtm.o
+	$(CC) $(CFLAGS) -std=gnu11 -O2 -Iinclude probe_points.c dtm.o -o $@ -ltiff -lm
+
+los_check: los_check.c include/dtm.h include/geo_utils.h dtm.o geo_utils.o
+	$(CC) $(CFLAGS) -std=gnu11 -O2 -Iinclude los_check.c dtm.o geo_utils.o -o $@ -ltiff -lm
+
 clean:
-	rm -f geo_utils.o dtm.o dtm_test terrain_viewer
+	rm -f geo_utils.o dtm.o dtm_test terrain_viewer probe_points los_check
