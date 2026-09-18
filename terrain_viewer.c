@@ -751,6 +751,76 @@ static int RunProfileMode(double lat1, double lon1, double heightFt1, double lat
 #define VIEWSHED_MAP_PX 900              /* square raster size, in pixels */
 #define VIEWSHED_RECEIVER_HEIGHT_M 1.5   /* typical handset/vehicle height above ground, added at every point being TESTED for visibility -- but NOT to the terrain profile itself, which is what actually blocks the line (see ComputeViewshedRaster's comment) */
 
+/* Optional RF signal-strength model, layered on top of the pure-geometry
+ * viewshed when the caller opts in (rf->enabled) by passing --freq/--erp
+ * on the command line. Two pieces, both standard textbook formulas:
+ *
+ * - Free-space path loss: FSPL(dB) = 20*log10(d_km) + 20*log10(f_MHz) +
+ *   32.44 -- how much a signal weakens with distance alone, clear sky.
+ *
+ * - Single knife-edge diffraction loss (ITU-R P.526, same family as the
+ *   curvature/refraction formulas already used elsewhere in this file):
+ *   given the ONE most-obstructing terrain point found so far along a ray
+ *   (tracked during the same running-horizon march the pure-geometry
+ *   viewshed already does -- see ComputeViewshedRaster), compute how far
+ *   that obstruction poked above the direct tower-to-target line (h,
+ *   accounting for Earth's curvature bulge at the obstruction's position)
+ *   relative to the signal's own Fresnel-zone size at that geometry (the
+ *   diffraction parameter nu), and from that a smooth, continuous loss in
+ *   dB -- ~0 for a well-clear path, rising through "marginal Fresnel
+ *   clearance" even before full geometric blockage, further rising once
+ *   truly blocked. This is why a spot just barely hidden behind a ridge
+ *   shows as weak-but-present signal rather than a hard cutoff, which is
+ *   physically realistic and matches how real cell edges behave.
+ *
+ * What this deliberately does NOT model: multiple obstructions along one
+ * path (this tracks only the single dominant one, not full multi-edge
+ * diffraction like Longley-Rice/ITM), antenna radiation pattern
+ * (isotropic assumed), ground conductivity/reflection, foliage/building
+ * clutter, or troposcatter. It's a solid, physically-grounded estimate --
+ * not the same fidelity as a professional RF planning tool. See README.md.
+ */
+typedef struct {
+    int enabled;
+    double freqMHz;
+    double eirpDbm;
+    double sensDbm; /* receiver sensitivity threshold -- below this, marked as no usable coverage regardless of the continuous color ramp */
+} RfParams;
+
+#define SPEED_OF_LIGHT_M_S 299792458.0
+
+static double FreeSpacePathLossDb(double distKm, double freqMHz) {
+    if (distKm < 0.001) distKm = 0.001; /* avoid log(0) right at the tower */
+    return 20.0 * log10(distKm) + 20.0 * log10(freqMHz) + 32.44;
+}
+
+static double KnifeEdgeDiffractionLossDb(double hM, double d1Km, double d2Km, double freqMHz) {
+    if (d1Km <= 0.0 || d2Km <= 0.0) return 0.0; /* no controlling obstruction registered yet */
+    double wavelengthM = SPEED_OF_LIGHT_M_S / (freqMHz * 1.0e6);
+    double d1M = d1Km * 1000.0, d2M = d2Km * 1000.0;
+    double nu = hM * sqrt(2.0 * (d1M + d2M) / (wavelengthM * d1M * d2M));
+    if (nu <= -0.7) return 0.0; /* well clear of the obstruction */
+    double L = 6.9 + 20.0 * log10(sqrt((nu - 0.1) * (nu - 0.1) + 1.0) + nu - 0.1);
+    return L < 0.0 ? 0.0 : L;
+}
+
+/* Color for a point marginDb above (or below) the sensitivity threshold --
+ * gray if it doesn't reach threshold at all (no usable coverage), else a
+ * red(weak, right at threshold)-yellow-green(strong, 40dB+ of margin)
+ * ramp, the same shape a real carrier coverage map uses. */
+static Color SignalColor(double marginDb) {
+    if (marginDb < 0.0) return (Color){ 140, 140, 140, 255 };
+    double t = marginDb / 40.0;
+    if (t > 1.0) t = 1.0;
+    Color weak = (Color){ 205, 60, 40, 255 }, mid = (Color){ 230, 200, 40, 255 }, strong = (Color){ 40, 140, 60, 255 };
+    Color a, b; double u;
+    if (t < 0.5) { a = weak; b = mid; u = t / 0.5; } else { a = mid; b = strong; u = (t - 0.5) / 0.5; }
+    return (Color){
+        (unsigned char)(a.r + (b.r - a.r) * u), (unsigned char)(a.g + (b.g - a.g) * u),
+        (unsigned char)(a.b + (b.b - a.b) * u), 255
+    };
+}
+
 /* Same running-max-angle horizon algorithm as ComputeVisibleDistanceKm,
  * generalized to mark every sample along every bearing (not just the
  * farthest visible one) and rasterize the result directly into `pixels`
@@ -767,8 +837,9 @@ static int RunProfileMode(double lat1, double lon1, double heightFt1, double lat
  * its OWN terrain and thereby suppress everything behind it. Standard
  * "observer offset / target offset" GIS viewshed practice, just applied
  * along one ray at a time. */
-static void ComputeViewshedRaster(Color *pixels, double towerLat, double towerLon, double towerElevM, double maxDistanceKm) {
-    double effectiveRadiusM = EARTH_RADIUS_KM * VISIBILITY_REFRACTION_K * 1000.0;
+static void ComputeViewshedRaster(Color *pixels, double towerLat, double towerLon, double towerElevM, double maxDistanceKm, const RfParams *rf) {
+    double effectiveRadiusKm = EARTH_RADIUS_KM * VISIBILITY_REFRACTION_K;
+    double effectiveRadiusM = effectiveRadiusKm * 1000.0;
     double metersPerPixel = (maxDistanceKm * 2000.0) / VIEWSHED_MAP_PX;
     double stepKm = metersPerPixel / 1000.0;
     if (stepKm < 0.005) stepKm = 0.005;
@@ -788,6 +859,7 @@ static void ComputeViewshedRaster(Color *pixels, double towerLat, double towerLo
         double bearingRad = bearing * DEG2RAD;
         double sinB = sin(bearingRad), cosB = cos(bearingRad);
         double maxAngle = -1e18;
+        double obstDistKm = -1.0, obstElevM = 0.0; /* the single controlling (worst-so-far) obstruction along this ray, for the RF model's diffraction term -- see the RfParams comment */
 
         for (double d = stepKm; d <= maxDistanceKm; d += stepKm) {
             double lat, lon;
@@ -798,15 +870,31 @@ static void ComputeViewshedRaster(Color *pixels, double towerLat, double towerLo
             if (ground == DTM_NODATA) break; /* no more loaded data this direction */
 
             double groundAngle = (ground - towerElevM) / dM - dM / (2.0 * effectiveRadiusM);
-            double receiverAngle = ((ground + VIEWSHED_RECEIVER_HEIGHT_M) - towerElevM) / dM - dM / (2.0 * effectiveRadiusM);
+            double rxElevM = ground + VIEWSHED_RECEIVER_HEIGHT_M;
+            double receiverAngle = (rxElevM - towerElevM) / dM - dM / (2.0 * effectiveRadiusM);
             int visible = receiverAngle > maxAngle;
-            if (groundAngle > maxAngle) maxAngle = groundAngle;
+
+            Color c;
+            if (rf->enabled) {
+                double diffLossDb = 0.0;
+                if (obstDistKm > 0.0) {
+                    double d1 = obstDistKm, d2 = d - obstDistKm;
+                    double bulgeAtObstM = 1000.0 * (d1 * d2) / (2.0 * effectiveRadiusKm);
+                    double lineElevAtObstM = towerElevM + (rxElevM - towerElevM) * (d1 / d) + bulgeAtObstM;
+                    diffLossDb = KnifeEdgeDiffractionLossDb(obstElevM - lineElevAtObstM, d1, d2, rf->freqMHz);
+                }
+                double prDbm = rf->eirpDbm - FreeSpacePathLossDb(d, rf->freqMHz) - diffLossDb;
+                c = SignalColor(prDbm - rf->sensDbm);
+            } else {
+                c = visible ? visibleColor : blockedColor;
+            }
+
+            if (groundAngle > maxAngle) { maxAngle = groundAngle; obstDistKm = d; obstElevM = ground; }
 
             double eastM = dM * sinB, northM = dM * cosB; /* bearing convention matches WalkForward/destination_point: 0=north, clockwise */
             int px = VIEWSHED_MAP_PX / 2 + (int)lround(eastM / metersPerPixel);
             int py = VIEWSHED_MAP_PX / 2 - (int)lround(northM / metersPerPixel); /* image Y grows downward; north is up */
 
-            Color c = visible ? visibleColor : blockedColor;
             for (int oy = -1; oy <= 1; oy++) {
                 int yy = py + oy;
                 if (yy < 0 || yy >= VIEWSHED_MAP_PX) continue;
@@ -820,7 +908,7 @@ static void ComputeViewshedRaster(Color *pixels, double towerLat, double towerLo
     }
 }
 
-static int RunViewshedMode(double towerLat, double towerLon, double heightFt, double maxDistanceKm, const char *screenshotPath) {
+static int RunViewshedMode(double towerLat, double towerLon, double heightFt, double maxDistanceKm, const RfParams *rf, const char *screenshotPath) {
     double towerGround = DtmSampleMeters(&g_dtm, towerLat, towerLon, 0);
     if (towerGround == DTM_NODATA) {
         fprintf(stderr, "terrain_viewer: tower position (%.5f, %.5f) isn't covered by any loaded DTM file\n", towerLat, towerLon);
@@ -829,13 +917,16 @@ static int RunViewshedMode(double towerLat, double towerLon, double heightFt, do
     double towerElevM = towerGround + heightFt * FEET_TO_METERS;
     printf("Viewshed: tower (%.5f,%.5f) %.0fm ground + %.0fft = %.0fm, range %.1f km, receiver height %.1fm\n",
            towerLat, towerLon, towerGround, heightFt, towerElevM, maxDistanceKm, VIEWSHED_RECEIVER_HEIGHT_M);
+    if (rf->enabled) {
+        printf("RF model: %.1f MHz, EIRP %.1f dBm, sensitivity threshold %.1f dBm\n", rf->freqMHz, rf->eirpDbm, rf->sensDbm);
+    }
 
     Color *pixels = malloc(sizeof(Color) * VIEWSHED_MAP_PX * VIEWSHED_MAP_PX);
     if (!pixels) { fprintf(stderr, "terrain_viewer: out of memory\n"); return 1; }
     for (int i = 0; i < VIEWSHED_MAP_PX * VIEWSHED_MAP_PX; i++) pixels[i] = (Color){ 224, 224, 224, 255 };
 
     printf("Computing viewshed raster...\n");
-    ComputeViewshedRaster(pixels, towerLat, towerLon, towerElevM, maxDistanceKm);
+    ComputeViewshedRaster(pixels, towerLat, towerLon, towerElevM, maxDistanceKm, rf);
     printf("Done.\n");
 
     SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT);
@@ -871,14 +962,32 @@ static int RunViewshedMode(double towerLat, double towerLon, double heightFt, do
 
         DrawText(TextFormat("Tower (%.5f, %.5f)  %.0fm ground + %.0fft antenna = %.0fm    range %.1f km",
                              towerLat, towerLon, towerGround, heightFt, towerElevM, maxDistanceKm), marginL, 8, 15, DARKGRAY);
-        DrawText("green = line-of-sight clear to tower   red = terrain-blocked   gray = outside loaded DTM coverage",
-                  marginL, 28, 14, DARKGRAY);
-        DrawText(TextFormat("assumes a %.1fm receiver height above ground at each point (not a signal-strength/path-loss model)", VIEWSHED_RECEIVER_HEIGHT_M),
-                  marginL, 46, 13, GRAY);
-        DrawRectangle(marginL, marginT + VIEWSHED_MAP_PX + 8, 14, 14, (Color){ 70, 160, 90, 255 });
-        DrawText("visible", marginL + 20, marginT + VIEWSHED_MAP_PX + 8, 14, DARKGRAY);
-        DrawRectangle(marginL + 90, marginT + VIEWSHED_MAP_PX + 8, 14, 14, (Color){ 195, 60, 50, 255 });
-        DrawText("blocked", marginL + 110, marginT + VIEWSHED_MAP_PX + 8, 14, DARKGRAY);
+        if (rf->enabled) {
+            DrawText(TextFormat("%.1f MHz, EIRP %.1f dBm  --  color = signal margin above %.0f dBm sensitivity threshold (gray = below it, no usable coverage)",
+                                 rf->freqMHz, rf->eirpDbm, rf->sensDbm), marginL, 28, 14, DARKGRAY);
+            DrawText(TextFormat("free-space path loss + single-knife-edge diffraction; %.1fm receiver height; NOT a substitute for a real RF survey", VIEWSHED_RECEIVER_HEIGHT_M),
+                      marginL, 46, 13, GRAY);
+
+            int barX = marginL, barY = marginT + VIEWSHED_MAP_PX + 8, barW = 260, barH = 14;
+            for (int i = 0; i < barW; i++) {
+                double marginDb = 40.0 * i / (barW - 1);
+                DrawLine(barX + i, barY, barX + i, barY + barH, SignalColor(marginDb));
+            }
+            DrawRectangleLines(barX, barY, barW, barH, DARKGRAY);
+            DrawText(TextFormat("%.0f dBm", rf->sensDbm), barX, barY + barH + 2, 12, DARKGRAY);
+            DrawText(TextFormat("%.0f dBm", rf->sensDbm + 40.0), barX + barW - 55, barY + barH + 2, 12, DARKGRAY);
+            DrawRectangle(barX + barW + 20, barY, 14, 14, (Color){ 140, 140, 140, 255 });
+            DrawText("no coverage", barX + barW + 40, barY, 14, DARKGRAY);
+        } else {
+            DrawText("green = line-of-sight clear to tower   red = terrain-blocked   gray = outside loaded DTM coverage",
+                      marginL, 28, 14, DARKGRAY);
+            DrawText(TextFormat("assumes a %.1fm receiver height above ground at each point (not a signal-strength/path-loss model)", VIEWSHED_RECEIVER_HEIGHT_M),
+                      marginL, 46, 13, GRAY);
+            DrawRectangle(marginL, marginT + VIEWSHED_MAP_PX + 8, 14, 14, (Color){ 70, 160, 90, 255 });
+            DrawText("visible", marginL + 20, marginT + VIEWSHED_MAP_PX + 8, 14, DARKGRAY);
+            DrawRectangle(marginL + 90, marginT + VIEWSHED_MAP_PX + 8, 14, 14, (Color){ 195, 60, 50, 255 });
+            DrawText("blocked", marginL + 110, marginT + VIEWSHED_MAP_PX + 8, 14, DARKGRAY);
+        }
 
         EndDrawing();
 
@@ -937,10 +1046,15 @@ int main(int argc, char **argv) {
     }
 
     if (argc >= 2 && strcmp(argv[1], "--viewshed") == 0) {
-        static const char *usage = "usage: %s --viewshed lat lon [+heightFt] maxDistanceKm [screenshot.png]\n"
+        static const char *usage = "usage: %s --viewshed lat lon [+heightFt] maxDistanceKm [options] [screenshot.png]\n"
                                     "  +heightFt is an optional antenna height in feet above ground at the\n"
                                     "  tower -- must start with '+', or it's read as maxDistanceKm instead;\n"
-                                    "  0 (ground level) if omitted. maxDistanceKm is the coverage radius to map.\n";
+                                    "  0 (ground level) if omitted. maxDistanceKm is the coverage radius to map.\n"
+                                    "  Options (all optional, any order, after maxDistanceKm):\n"
+                                    "    --erp watts    transmitter ERP in watts -- ALSO enables the RF signal-\n"
+                                    "                   strength model (default: off, pure geometric LOS map)\n"
+                                    "    --freq MHz     carrier frequency in MHz (default: 869, cellular Band A)\n"
+                                    "    --sens dBm     receiver sensitivity threshold (default: -100)\n";
         if (argc < 5) {
             fprintf(stderr, usage, argv[0]);
             return 1;
@@ -958,8 +1072,27 @@ int main(int argc, char **argv) {
             return 1;
         }
         double maxDistanceKm = atof(argv[argi++]);
-        const char *screenshot = (argi < argc) ? argv[argi] : getenv("TV_SCREENSHOT");
-        return RunViewshedMode(lat, lon, heightFt, maxDistanceKm, screenshot);
+
+        RfParams rf = { 0, 869.0, 0.0, -100.0 };
+        const char *screenshot = getenv("TV_SCREENSHOT");
+        while (argi < argc) {
+            if (strcmp(argv[argi], "--freq") == 0 && argi + 1 < argc) {
+                rf.freqMHz = atof(argv[argi + 1]);
+                argi += 2;
+            } else if (strcmp(argv[argi], "--erp") == 0 && argi + 1 < argc) {
+                double erpWatts = atof(argv[argi + 1]);
+                rf.eirpDbm = 10.0 * log10(erpWatts * 1000.0) + 2.15; /* ERP (ref. dipole) -> EIRP (ref. isotropic), the FCC's usual "power" convention */
+                rf.enabled = 1;
+                argi += 2;
+            } else if (strcmp(argv[argi], "--sens") == 0 && argi + 1 < argc) {
+                rf.sensDbm = atof(argv[argi + 1]);
+                argi += 2;
+            } else {
+                screenshot = argv[argi];
+                argi++;
+            }
+        }
+        return RunViewshedMode(lat, lon, heightFt, maxDistanceKm, &rf, screenshot);
     }
 
     LoadDefaultDtmSet();

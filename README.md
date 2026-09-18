@@ -142,20 +142,52 @@ leaves Wyoming.
 
 RUNNING -- viewshed mode:
 
-    ./terrain_viewer --viewshed lat lon [+heightFt] maxDistanceKm [screenshot.png]
+    ./terrain_viewer --viewshed lat lon [+heightFt] maxDistanceKm [options] [screenshot.png]
+
+    Options (any order, after maxDistanceKm):
+      --erp watts    transmitter ERP in watts -- ALSO enables the RF
+                     signal-strength model below (default: off, pure
+                     geometric LOS map)
+      --freq MHz     carrier frequency in MHz (default: 869, cellular Band A)
+      --sens dBm     receiver sensitivity threshold (default: -100)
 
 Given a tower's position and antenna height (`+heightFt`, feet above
 ground, 0 if omitted -- same `+` convention as `--profile`), rasterizes a
-top-down map (north up, tower at center) of every ground point within
-`maxDistanceKm` showing whether it has clear, curvature-and-terrain-
-corrected line of sight to that tower: green if a straight line from the
-tower clears the terrain, red if a nearer ridge blocks it, gray where the
-loaded DTM tiles don't reach. Distance rings mark 25/50/75/100% of
-`maxDistanceKm`. This is a **pure geometric line-of-sight map** -- no path
-loss, antenna radiation pattern, Fresnel-zone clearance, or signal
-strength is modeled. Green means "a straight line to the tower isn't
-blocked by terrain", not "you'll get a strong signal there"; treat it as
-scouting which areas *could* work, not a coverage guarantee.
+top-down map (north up, tower at center) of coverage within
+`maxDistanceKm`. Distance rings mark 25/50/75/100% of `maxDistanceKm`.
+
+Without `--erp` (the default), this is a **pure geometric line-of-sight
+map**: green if a straight line from the tower clears the terrain
+(curvature and refraction accounted for), red if a nearer ridge blocks it,
+gray where the loaded DTM tiles don't reach. No path loss, antenna
+radiation pattern, Fresnel-zone clearance, or signal strength is modeled --
+green means "a straight line to the tower isn't blocked by terrain", not
+"you'll get a strong signal there".
+
+With `--erp`, a real (if simplified) **RF signal-strength model** replaces
+the binary map with a continuous one: free-space path loss (`20*log10(d_km)
++ 20*log10(f_MHz) + 32.44`) plus single-knife-edge diffraction loss
+(ITU-R P.526 -- same family as `--profile`'s curvature formula) computed
+from the single worst obstruction found so far along each ray, relative to
+the signal's own Fresnel-zone geometry at that point. Color is a red
+(weak, right at the sensitivity threshold) -> yellow -> green (strong,
+40dB+ of margin) ramp; gray means the point doesn't reach the sensitivity
+threshold at all. `--erp` is watts (matching how FCC license records
+usually report it, as ERP referenced to a dipole); it's converted to EIRP
+internally (`+2.15 dB`) since that's what the path-loss math needs. This
+tends to show meaningfully more coverage than the plain LOS map, because
+real signals bend around obstacles they can't see past in a straight
+line -- particularly noticeable at low cellular bands like 850MHz
+(`--freq`'s default), which is exactly why carriers favor low-band
+spectrum for rural/terrain-heavy coverage.
+
+What this does **not** model, even with `--erp`: multiple obstructions
+along one path (only the single dominant one, unlike full multi-edge
+models such as Longley-Rice/ITM -- the FCC's own standard, and a much
+bigger undertaking were it ever worth porting), antenna radiation pattern
+(isotropic assumed), ground conductivity/reflection, foliage or building
+clutter, or troposcatter. Treat this as a solid, physically-grounded
+estimate for scouting -- not a substitute for a real RF site survey.
 
 Each map point is tested at `VIEWSHED_RECEIVER_HEIGHT_M` (1.5m, a typical
 handset/vehicle height) above the DTM's bare-ground elevation there, while
