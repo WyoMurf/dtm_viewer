@@ -739,6 +739,160 @@ static int RunProfileMode(double lat1, double lon1, double heightFt1, double lat
     return 0;
 }
 
+/* --- Viewshed mode: given a tower (lat, lon, antenna height), rasterize a
+ * top-down map of which ground points within maxDistanceKm have a clear,
+ * curvature-and-terrain-corrected line of sight to it -- e.g. for scouting
+ * where cellular coverage from a given tower actually reaches versus where
+ * a ridge blocks it. This is a pure geometric line-of-sight map: no path
+ * loss, antenna radiation pattern, Fresnel-zone clearance, or signal
+ * strength is modeled -- green means "a straight line to the tower clears
+ * the terrain", not "you'll have usable signal there". See README.md. */
+
+#define VIEWSHED_MAP_PX 900              /* square raster size, in pixels */
+#define VIEWSHED_RECEIVER_HEIGHT_M 1.5   /* typical handset/vehicle height above ground, added at every point being TESTED for visibility -- but NOT to the terrain profile itself, which is what actually blocks the line (see ComputeViewshedRaster's comment) */
+
+/* Same running-max-angle horizon algorithm as ComputeVisibleDistanceKm,
+ * generalized to mark every sample along every bearing (not just the
+ * farthest visible one) and rasterize the result directly into `pixels`
+ * (VIEWSHED_MAP_PX x VIEWSHED_MAP_PX, tower at the center, north up).
+ *
+ * Two different elevations matter at each step and must NOT be conflated:
+ * groundAngle (bare terrain) is what updates the running horizon, because
+ * real terrain blocks everything farther along the ray regardless of who's
+ * asking; receiverAngle (terrain + VIEWSHED_RECEIVER_HEIGHT_M) is what
+ * gets compared against that horizon to decide THIS point's own
+ * visibility, because a receiver a couple meters off the ground can see
+ * past an obstruction a person standing at ground level couldn't -- but
+ * that same couple meters shouldn't let a receiver claim it can see over
+ * its OWN terrain and thereby suppress everything behind it. Standard
+ * "observer offset / target offset" GIS viewshed practice, just applied
+ * along one ray at a time. */
+static void ComputeViewshedRaster(Color *pixels, double towerLat, double towerLon, double towerElevM, double maxDistanceKm) {
+    double effectiveRadiusM = EARTH_RADIUS_KM * VISIBILITY_REFRACTION_K * 1000.0;
+    double metersPerPixel = (maxDistanceKm * 2000.0) / VIEWSHED_MAP_PX;
+    double stepKm = metersPerPixel / 1000.0;
+    if (stepKm < 0.005) stepKm = 0.005;
+
+    double angleStepDeg = (metersPerPixel / (maxDistanceKm * 1000.0)) * (180.0 / M_PI);
+    if (angleStepDeg < 0.05) angleStepDeg = 0.05;
+    if (angleStepDeg > 2.0) angleStepDeg = 2.0;
+    int bearingCount = (int)(360.0 / angleStepDeg);
+    if (bearingCount < 360) bearingCount = 360;
+    if (bearingCount > 3600) bearingCount = 3600;
+
+    Color visibleColor = (Color){ 70, 160, 90, 255 };
+    Color blockedColor = (Color){ 195, 60, 50, 255 };
+
+    for (int b = 0; b < bearingCount; b++) {
+        double bearing = 360.0 * b / bearingCount;
+        double bearingRad = bearing * DEG2RAD;
+        double sinB = sin(bearingRad), cosB = cos(bearingRad);
+        double maxAngle = -1e18;
+
+        for (double d = stepKm; d <= maxDistanceKm; d += stepKm) {
+            double lat, lon;
+            destination_point(towerLat, towerLon, bearing, d, EARTH_RADIUS_KM, &lat, &lon);
+            double dM = d * 1000.0;
+            int level = d < 2.0 ? 0 : d < 8.0 ? 2 : 4;
+            double ground = DtmSampleMeters(&g_dtm, lat, lon, level);
+            if (ground == DTM_NODATA) break; /* no more loaded data this direction */
+
+            double groundAngle = (ground - towerElevM) / dM - dM / (2.0 * effectiveRadiusM);
+            double receiverAngle = ((ground + VIEWSHED_RECEIVER_HEIGHT_M) - towerElevM) / dM - dM / (2.0 * effectiveRadiusM);
+            int visible = receiverAngle > maxAngle;
+            if (groundAngle > maxAngle) maxAngle = groundAngle;
+
+            double eastM = dM * sinB, northM = dM * cosB; /* bearing convention matches WalkForward/destination_point: 0=north, clockwise */
+            int px = VIEWSHED_MAP_PX / 2 + (int)lround(eastM / metersPerPixel);
+            int py = VIEWSHED_MAP_PX / 2 - (int)lround(northM / metersPerPixel); /* image Y grows downward; north is up */
+
+            Color c = visible ? visibleColor : blockedColor;
+            for (int oy = -1; oy <= 1; oy++) {
+                int yy = py + oy;
+                if (yy < 0 || yy >= VIEWSHED_MAP_PX) continue;
+                for (int ox = -1; ox <= 1; ox++) {
+                    int xx = px + ox;
+                    if (xx < 0 || xx >= VIEWSHED_MAP_PX) continue;
+                    pixels[yy * VIEWSHED_MAP_PX + xx] = c;
+                }
+            }
+        }
+    }
+}
+
+static int RunViewshedMode(double towerLat, double towerLon, double heightFt, double maxDistanceKm, const char *screenshotPath) {
+    double towerGround = DtmSampleMeters(&g_dtm, towerLat, towerLon, 0);
+    if (towerGround == DTM_NODATA) {
+        fprintf(stderr, "terrain_viewer: tower position (%.5f, %.5f) isn't covered by any loaded DTM file\n", towerLat, towerLon);
+        return 1;
+    }
+    double towerElevM = towerGround + heightFt * FEET_TO_METERS;
+    printf("Viewshed: tower (%.5f,%.5f) %.0fm ground + %.0fft = %.0fm, range %.1f km, receiver height %.1fm\n",
+           towerLat, towerLon, towerGround, heightFt, towerElevM, maxDistanceKm, VIEWSHED_RECEIVER_HEIGHT_M);
+
+    Color *pixels = malloc(sizeof(Color) * VIEWSHED_MAP_PX * VIEWSHED_MAP_PX);
+    if (!pixels) { fprintf(stderr, "terrain_viewer: out of memory\n"); return 1; }
+    for (int i = 0; i < VIEWSHED_MAP_PX * VIEWSHED_MAP_PX; i++) pixels[i] = (Color){ 224, 224, 224, 255 };
+
+    printf("Computing viewshed raster...\n");
+    ComputeViewshedRaster(pixels, towerLat, towerLon, towerElevM, maxDistanceKm);
+    printf("Done.\n");
+
+    SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT);
+    InitWindow(VIEWSHED_MAP_PX + 60, VIEWSHED_MAP_PX + 130, "DTM Viewshed");
+
+    Image img = { pixels, VIEWSHED_MAP_PX, VIEWSHED_MAP_PX, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8 };
+    Texture2D tex = LoadTextureFromImage(img);
+    free(pixels);
+
+    int frameCount = 0;
+    int screenshotFrame = getenv("TV_SCREENSHOT_FRAME") ? atoi(getenv("TV_SCREENSHOT_FRAME")) : 5;
+    int marginL = 30, marginT = 70;
+
+    while (!WindowShouldClose()) {
+        frameCount++;
+        BeginDrawing();
+        ClearBackground(RAYWHITE);
+
+        DrawTexture(tex, marginL, marginT, WHITE);
+        DrawRectangleLines(marginL, marginT, VIEWSHED_MAP_PX, VIEWSHED_MAP_PX, GRAY);
+
+        int cx = marginL + VIEWSHED_MAP_PX / 2, cy = marginT + VIEWSHED_MAP_PX / 2;
+        for (int ring = 1; ring <= 4; ring++) {
+            float r = (float)VIEWSHED_MAP_PX / 2.0f * ring / 4.0f;
+            DrawCircleLines(cx, cy, r, (Color){ 120, 120, 120, 160 });
+            DrawText(TextFormat("%.1fkm", maxDistanceKm * ring / 4.0), cx + 4, (int)(cy - r) + 2, 13, DARKGRAY);
+        }
+        DrawLine(cx, marginT, cx, marginT + VIEWSHED_MAP_PX, (Color){ 150, 150, 150, 90 });
+        DrawLine(marginL, cy, marginL + VIEWSHED_MAP_PX, cy, (Color){ 150, 150, 150, 90 });
+        DrawCircle(cx, cy, 5, BLACK);
+        DrawCircle(cx, cy, 3, YELLOW);
+        DrawText("N", cx - 4, marginT - 18, 16, DARKGRAY);
+
+        DrawText(TextFormat("Tower (%.5f, %.5f)  %.0fm ground + %.0fft antenna = %.0fm    range %.1f km",
+                             towerLat, towerLon, towerGround, heightFt, towerElevM, maxDistanceKm), marginL, 8, 15, DARKGRAY);
+        DrawText("green = line-of-sight clear to tower   red = terrain-blocked   gray = outside loaded DTM coverage",
+                  marginL, 28, 14, DARKGRAY);
+        DrawText(TextFormat("assumes a %.1fm receiver height above ground at each point (not a signal-strength/path-loss model)", VIEWSHED_RECEIVER_HEIGHT_M),
+                  marginL, 46, 13, GRAY);
+        DrawRectangle(marginL, marginT + VIEWSHED_MAP_PX + 8, 14, 14, (Color){ 70, 160, 90, 255 });
+        DrawText("visible", marginL + 20, marginT + VIEWSHED_MAP_PX + 8, 14, DARKGRAY);
+        DrawRectangle(marginL + 90, marginT + VIEWSHED_MAP_PX + 8, 14, 14, (Color){ 195, 60, 50, 255 });
+        DrawText("blocked", marginL + 110, marginT + VIEWSHED_MAP_PX + 8, 14, DARKGRAY);
+
+        EndDrawing();
+
+        if (screenshotPath && frameCount == screenshotFrame) {
+            TakeScreenshot(screenshotPath);
+            break;
+        }
+    }
+
+    UnloadTexture(tex);
+    CloseWindow();
+    return 0;
+}
+
 static void LoadDefaultDtmSet(void) {
     for (int i = 0; i < DEFAULT_DTM_COUNT; i++) {
         if (DtmSetAddFile(&g_dtm, kDefaultDtmPaths[i]) != 0) {
@@ -780,6 +934,32 @@ int main(int argc, char **argv) {
 
         const char *screenshot = (argi < argc) ? argv[argi] : getenv("TV_SCREENSHOT");
         return RunProfileMode(lat1, lon1, heightFt1, lat2, lon2, heightFt2, screenshot);
+    }
+
+    if (argc >= 2 && strcmp(argv[1], "--viewshed") == 0) {
+        static const char *usage = "usage: %s --viewshed lat lon [+heightFt] maxDistanceKm [screenshot.png]\n"
+                                    "  +heightFt is an optional antenna height in feet above ground at the\n"
+                                    "  tower -- must start with '+', or it's read as maxDistanceKm instead;\n"
+                                    "  0 (ground level) if omitted. maxDistanceKm is the coverage radius to map.\n";
+        if (argc < 5) {
+            fprintf(stderr, usage, argv[0]);
+            return 1;
+        }
+        LoadDefaultDtmSet();
+
+        int argi = 2;
+        double lat = atof(argv[argi++]);
+        double lon = atof(argv[argi++]);
+        double heightFt = 0.0;
+        if (argi < argc && argv[argi][0] == '+') heightFt = atof(argv[argi++]);
+
+        if (argi >= argc) {
+            fprintf(stderr, usage, argv[0]);
+            return 1;
+        }
+        double maxDistanceKm = atof(argv[argi++]);
+        const char *screenshot = (argi < argc) ? argv[argi] : getenv("TV_SCREENSHOT");
+        return RunViewshedMode(lat, lon, heightFt, maxDistanceKm, screenshot);
     }
 
     LoadDefaultDtmSet();

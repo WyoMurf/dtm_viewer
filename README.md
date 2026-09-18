@@ -140,6 +140,38 @@ two points. Points outside all three loaded DTM tiles' coverage show as a
 gap in the terrain line (NODATA), which is expected for a long profile that
 leaves Wyoming.
 
+RUNNING -- viewshed mode:
+
+    ./terrain_viewer --viewshed lat lon [+heightFt] maxDistanceKm [screenshot.png]
+
+Given a tower's position and antenna height (`+heightFt`, feet above
+ground, 0 if omitted -- same `+` convention as `--profile`), rasterizes a
+top-down map (north up, tower at center) of every ground point within
+`maxDistanceKm` showing whether it has clear, curvature-and-terrain-
+corrected line of sight to that tower: green if a straight line from the
+tower clears the terrain, red if a nearer ridge blocks it, gray where the
+loaded DTM tiles don't reach. Distance rings mark 25/50/75/100% of
+`maxDistanceKm`. This is a **pure geometric line-of-sight map** -- no path
+loss, antenna radiation pattern, Fresnel-zone clearance, or signal
+strength is modeled. Green means "a straight line to the tower isn't
+blocked by terrain", not "you'll get a strong signal there"; treat it as
+scouting which areas *could* work, not a coverage guarantee.
+
+Each map point is tested at `VIEWSHED_RECEIVER_HEIGHT_M` (1.5m, a typical
+handset/vehicle height) above the DTM's bare-ground elevation there, while
+the terrain itself (not that same receiver height) is what determines
+whether a closer point blocks a farther one along each ray -- standard
+"observer offset / target offset" viewshed practice, and the reason a
+point's own ground elevation can't disqualify itself while still
+correctly blocking everything behind it. `ComputeViewshedRaster` in
+`terrain_viewer.c` reuses the exact curvature/refraction model `--profile`
+does, generalized from "how far can I see in one direction" (a single
+running-max-angle horizon march) to a full radial sweep across ~360-3600
+bearings (adaptive to `maxDistanceKm` and the fixed 900px raster
+resolution) that rasterizes every sample as it's computed, rather than
+just the farthest visible point. Runs in under 2 seconds even at a 20km
+radius against the full DTM set.
+
 KNOWN LIMITATIONS (deliberate v1 scope, not oversights):
 
 - The walkthrough is one regenerable heightfield window, not a proper
