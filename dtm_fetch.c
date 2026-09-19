@@ -97,8 +97,16 @@ static int DownloadFile(const char *url, const char *localPath) {
     char cmd[1200];
     /* -f: fail (nonzero exit) on HTTP errors rather than saving an error
      * page; the partial/temp file curl leaves behind on failure is fine to
-     * ignore -- a retry just overwrites it. */
-    snprintf(cmd, sizeof(cmd), "curl -sf --max-time 600 -o '%s' '%s'", localPath, url);
+     * ignore -- a retry just overwrites it (and TrySource's size check
+     * catches anything that slips through as "successful" but short).
+     * A flat --max-time doesn't work here: USGS tiles are ~400MB but
+     * Wyoming's are up to ~4GB, and at this project's observed real-world
+     * link speed (~2MB/s to either bucket) a big Wyoming tile alone needs
+     * ~30+ minutes. --speed-limit/--speed-time aborts only on a genuine
+     * stall (under 5KB/s sustained for 60s) instead of total duration, so
+     * it scales to whatever size the tile turns out to be; --max-time is
+     * still there as a 3-hour absolute backstop. */
+    snprintf(cmd, sizeof(cmd), "curl -sf --speed-limit 5120 --speed-time 60 --max-time 10800 -o '%s' '%s'", localPath, url);
     return system(cmd) == 0 ? 0 : -1;
 }
 
