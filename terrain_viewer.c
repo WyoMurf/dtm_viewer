@@ -14,6 +14,7 @@
 #include "raymath.h"
 #include "dtm.h"
 #include "dtm_fetch.h"
+#include "osm_roads.h"
 #include "geo_utils.h"
 
 static void EnsureCoverageOrWarn(double lat, double lon);
@@ -929,6 +930,48 @@ static void ComputeViewshedRaster(Color *pixels, double towerLat, double towerLo
     }
 }
 
+static void DrawPixelLine(Color *pixels, int w, int h, int x0, int y0, int x1, int y1, Color c) {
+    int dx = abs(x1 - x0), dy = abs(y1 - y0);
+    int steps = dx > dy ? dx : dy;
+    if (steps == 0) {
+        if (x0 >= 0 && x0 < w && y0 >= 0 && y0 < h) pixels[y0 * w + x0] = c;
+        return;
+    }
+    for (int i = 0; i <= steps; i++) {
+        int x = x0 + (x1 - x0) * i / steps;
+        int y = y0 + (y1 - y0) * i / steps;
+        if (x >= 0 && x < w && y >= 0 && y < h) pixels[y * w + x] = c;
+    }
+}
+
+/* Best-effort overlay of real streets (see osm_roads.h) onto the already-
+ * computed coverage raster, reusing the exact same tower-centered,
+ * north-up local-meters projection ComputeViewshedRaster used to place
+ * its own samples. Silently draws nothing if the fetch fails or the area
+ * has no mapped roads -- this is a visual aid, never a reason to fail
+ * the whole viewshed. */
+static void DrawRoadOverlay(Color *pixels, double towerLat, double towerLon, double maxDistanceKm) {
+    if (getenv("TV_NO_ROADS")) return;
+    OsmRoadSet roads = { 0 };
+    if (OsmRoadsFetch(towerLat, towerLon, maxDistanceKm, &roads) != 0) return;
+
+    double metersPerPixel = (maxDistanceKm * 2000.0) / VIEWSHED_MAP_PX;
+    Color roadColor = (Color){ 30, 30, 30, 255 };
+    for (int i = 0; i < roads.way_count; i++) {
+        OsmWay *w = &roads.ways[i];
+        int prevPx = 0, prevPy = 0, havePrev = 0;
+        for (int j = 0; j < w->count; j++) {
+            double eastM, northM;
+            DtmLonLatToLocalMeters(towerLat, towerLon, w->lat[j], w->lon[j], &eastM, &northM);
+            int px = VIEWSHED_MAP_PX / 2 + (int)lround(eastM / metersPerPixel);
+            int py = VIEWSHED_MAP_PX / 2 - (int)lround(northM / metersPerPixel);
+            if (havePrev) DrawPixelLine(pixels, VIEWSHED_MAP_PX, VIEWSHED_MAP_PX, prevPx, prevPy, px, py, roadColor);
+            prevPx = px; prevPy = py; havePrev = 1;
+        }
+    }
+    OsmRoadsFree(&roads);
+}
+
 static int RunViewshedMode(double towerLat, double towerLon, double heightFt, double maxDistanceKm, const RfParams *rf, const char *screenshotPath) {
     EnsureCoverageOrWarn(towerLat, towerLon);
     for (int b = 0; b < 8; b++) {
@@ -956,6 +999,8 @@ static int RunViewshedMode(double towerLat, double towerLon, double heightFt, do
     printf("Computing viewshed raster...\n");
     ComputeViewshedRaster(pixels, towerLat, towerLon, towerElevM, maxDistanceKm, rf);
     printf("Done.\n");
+
+    DrawRoadOverlay(pixels, towerLat, towerLon, maxDistanceKm);
 
     SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT);
     InitWindow(VIEWSHED_MAP_PX + 60, VIEWSHED_MAP_PX + 130, "DTM Viewshed");
@@ -1006,6 +1051,8 @@ static int RunViewshedMode(double towerLat, double towerLon, double heightFt, do
             DrawText(TextFormat("%.0f dBm", rf->sensDbm + 40.0), barX + barW - 55, barY + barH + 2, 12, DARKGRAY);
             DrawRectangle(barX + barW + 20, barY, 14, 14, (Color){ 140, 140, 140, 255 });
             DrawText("no coverage", barX + barW + 40, barY, 14, DARKGRAY);
+            DrawLine(barX + barW + 150, barY + 7, barX + barW + 164, barY + 7, (Color){ 30, 30, 30, 255 });
+            DrawText("streets (OpenStreetMap)", barX + barW + 170, barY, 14, DARKGRAY);
         } else {
             DrawText("green = line-of-sight clear to tower   red = terrain-blocked   gray = outside loaded DTM coverage",
                       marginL, 28, 14, DARKGRAY);
@@ -1015,6 +1062,8 @@ static int RunViewshedMode(double towerLat, double towerLon, double heightFt, do
             DrawText("visible", marginL + 20, marginT + VIEWSHED_MAP_PX + 8, 14, DARKGRAY);
             DrawRectangle(marginL + 90, marginT + VIEWSHED_MAP_PX + 8, 14, 14, (Color){ 195, 60, 50, 255 });
             DrawText("blocked", marginL + 110, marginT + VIEWSHED_MAP_PX + 8, 14, DARKGRAY);
+            DrawLine(marginL + 180, marginT + VIEWSHED_MAP_PX + 15, marginL + 194, marginT + VIEWSHED_MAP_PX + 15, (Color){ 30, 30, 30, 255 });
+            DrawText("streets (OpenStreetMap)", marginL + 200, marginT + VIEWSHED_MAP_PX + 8, 14, DARKGRAY);
         }
 
         EndDrawing();

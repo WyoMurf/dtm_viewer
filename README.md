@@ -238,6 +238,21 @@ resolution) that rasterizes every sample as it's computed, rather than
 just the farthest visible point. Runs in under 2 seconds even at a 20km
 radius against the full DTM set.
 
+Real streets are overlaid on top of the coverage raster for whatever
+community happens to fall inside the mapped circle -- `osm_roads.c` fetches
+every `highway=*` way in a padded bounding box around the map from
+OpenStreetMap's public API (`api.openstreetmap.org/api/0.6/map`, no auth,
+no key), hand-parses the XML (two linear scans: collect every referenced
+node, then resolve each way's `<nd ref>` list against them -- not a general
+XML parser, matching how `dtm.c` already hand-parses GeoTIFF tags instead
+of depending on more of libtiff than it needs), and draws each way as a
+thin line in the same tower-centered, north-up local-meters projection
+`ComputeViewshedRaster` used for the coverage colors. Best-effort and never
+fatal: a fetch failure, zero mapped roads, or a `maxDistanceKm` whose
+bounding box exceeds the API's ~0.25-square-degree limit all just mean no
+streets get drawn that run, not a crash. `TV_NO_ROADS=1` skips the fetch
+entirely (headless/offline testing).
+
 SCOUTING TOOLS (`make probe_points los_check`):
 
 Two small headless helpers (no raylib, no window) for batch terrain
