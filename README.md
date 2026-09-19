@@ -11,24 +11,54 @@ texture and city dots -- this project is standalone and doesn't depend on
 it, but the two pair well if you want both a globe view and a ground-level
 view of the same place.)
 
-DATA:
+DATA SOURCES:
 
-This was built against three wyolidar (Wyoming lidar, https://lidar.wygisc.org/wyolidar)
-DTM GeoTIFFs covering Cody, Meeteetse, and the Bighorn Mountains -- Cloud
-Optimized GeoTIFFs (BigTIFF), single-band 16-bit unsigned int elevation in
-whole meters, EPSG:4326 (geographic lat/lon, ~1m/pixel), LZW-compressed,
-with an 11-level overview pyramid. No ingestion tool is needed -- `dtm.c`
-reads these files directly.
+`terrain_viewer` locates and downloads whatever DTM tile(s) cover wherever
+you point it, anywhere in the US -- no manual data prep needed. Two real,
+public, unauthenticated data sources, tried in order (`dtm_fetch.c`):
 
-By default `terrain_viewer` looks for these three specific files at fixed
-paths on the machine it was developed on (100.74.88.66):
+1. **Wyoming wyolidar** (https://lidar.wygisc.org/wyolidar, bucket
+   `wyolidar.s3.arcc.uwyo.edu`) -- ~1m lidar, statewide (40 tiles,
+   `W104N041`..`W111N045`). Cloud Optimized GeoTIFFs (BigTIFF), single-band
+   16-bit unsigned int elevation in whole meters, EPSG:4326 (geographic
+   lat/lon), LZW-compressed, 11-level overview pyramid. This project's
+   original three manually-downloaded tiles (Cody/Meeteetse/Bighorn) are
+   this same format and are reused as-is, never re-fetched.
+2. **USGS 3DEP** (bucket `prd-tnm.s3.amazonaws.com`) -- nationwide 1/3
+   arc-second (~10m) seamless DEM, tried wherever Wyoming's higher-res data
+   doesn't reach. Classic TIFF, single-band 32-bit float elevation in
+   meters, clean degree-aligned tiles (`n{lat}w{lon}` naming), NODATA
+   -999999. NAD83 vs. Wyoming's WGS84 datum -- a ~1-2m horizontal
+   discrepancy in CONUS, well below this tool's precision.
 
-    /home/murf/wyodem/lidar/W109N044_Deg_Cog.tif  (Cody)
-    /home/murf/wyodem/lidar/W108N044_Deg_Cog.tif  (Meeteetse)
-    /home/murf/wyodem/lidar/W107N044_Deg_Cog.tif  (Bighorn Mountains / Cloud Peak)
+`dtm.c` reads both layouts directly (uint16 or float32 samples, detected
+per-file from the TIFF tags) -- no ingestion tool needed for either.
 
-To point it at different DTM files, edit `kDefaultDtmPaths` in
-`terrain_viewer.c`.
+At startup, `terrain_viewer` scans two directories for `*.tif` and loads
+whatever's already there: `/home/murf/wyodem/lidar` (the original
+hand-downloaded Wyoming tiles) and `~/dtm_cache` (where auto-downloaded
+tiles, from either source, land and get reused on future runs). To add
+your own pre-downloaded tiles, just drop them in either directory --
+edit `kDtmSearchDirs` in `terrain_viewer.c` to add more.
+
+Once you point the tool at an actual location (walk mode's start point;
+`--profile`'s two endpoints plus points every ~15% along the path;
+`--viewshed`'s center plus points along 8 compass bearings at
+`maxDistanceKm`), it checks whether a loaded file already covers each
+point and, if not, looks for the right tile at each source in turn: a
+HEAD request confirms it exists and reports its size, then -- unless
+`TV_AUTO_DOWNLOAD=1` is set -- prompts `y/N` on stdin before actually
+downloading (`curl`) into `~/dtm_cache`. Coverage is checked once at each
+mode's natural anchor points, not continuously, so walking far enough out
+of a walk-mode session's initial coverage during a long walk can still run
+off the edge of loaded data (matching this project's existing "known
+limitations, not oversights" pattern -- restart at the new location rather
+than expecting it to fetch mid-walk). A point with no coverage at either
+source (ocean, outside the US) just prints a warning and shows as NODATA.
+
+`TV_AUTO_DOWNLOAD=1` skips the confirmation prompt -- needed for
+`TV_SCREENSHOT` headless/scripted runs, or anyone who wants this
+non-interactive.
 
 BUILDING:
 
@@ -45,6 +75,11 @@ instructions; `Makefile`'s `RAYLIB_DIR` points at where it expects to find
 elevation at a handful of hardcoded probe points plus a coarse per-file
 min/max scan, both useful for confirming a new file's tags parsed correctly
 before trusting it in the viewer.
+
+`make dtm_fetch_test` builds a standalone smoke test for the auto-download
+logic (no raylib needed): `./dtm_fetch_test cacheDir lat lon` ensures
+coverage at that point (downloading if needed, prompting unless
+`TV_AUTO_DOWNLOAD=1`) and prints the sampled elevation there.
 
 RUNNING -- walkthrough mode:
 
@@ -136,9 +171,8 @@ away from each end (d1+d2 = total distance) clears the curved Earth's
 surface by `d1*d2 / (2*k*R)` less than flat-plane geometry suggests. Any
 stretch of raw terrain (thick brown) that pokes above that reference line
 is highlighted in bright red -- it blocks direct line-of-sight between the
-two points. Points outside all three loaded DTM tiles' coverage show as a
-gap in the terrain line (NODATA), which is expected for a long profile that
-leaves Wyoming.
+two points. Points with no DTM coverage at all (ocean, outside the US --
+see DATA SOURCES above) show as a gap in the terrain line (NODATA).
 
 RUNNING -- viewshed mode:
 

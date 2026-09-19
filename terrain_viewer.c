@@ -1,14 +1,22 @@
+#define _POSIX_C_SOURCE 200809L /* glob, mkdir */
+#define _DEFAULT_SOURCE 1 /* M_PI and friends in math.h, which _POSIX_C_SOURCE alone hides */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <stdint.h>
+#include <glob.h>
+#include <sys/stat.h>
 
 #include "raylib.h"
 #include "rlgl.h"
 #include "raymath.h"
 #include "dtm.h"
+#include "dtm_fetch.h"
 #include "geo_utils.h"
+
+static void EnsureCoverageOrWarn(double lat, double lon);
 
 /*
  * Ground-level companion to earth_viewer.c: instead of an orbit camera
@@ -35,15 +43,19 @@ static const NamedPlace kPlaces[] = {
 };
 #define PLACE_COUNT (int)(sizeof(kPlaces) / sizeof(kPlaces[0]))
 
-/* Default DTM file locations on this specific machine (100.74.88.66) --
- * see README-terrain.md. Overridable via argv if this ever runs elsewhere. */
-static const char *kDefaultDtmPaths[] = {
-    "/home/murf/wyodem/lidar/W109N044_Deg_Cog.tif", /* Cody */
-    "/home/murf/wyodem/lidar/W108N044_Deg_Cog.tif", /* Meeteetse */
-    "/home/murf/wyodem/lidar/W107N044_Deg_Cog.tif", /* Bighorn */
+/* Where DTM tiles are looked for at startup (whatever's already there
+ * loads immediately, no network needed) and where EnsureDtmCoverage (see
+ * dtm_fetch.h) downloads new ones on demand once a target location is
+ * known. The first entry is this project's original manually-downloaded
+ * Wyoming tiles; the second (computed at startup into g_dtmCacheDir) is
+ * where auto-downloaded tiles -- Wyoming or USGS 3DEP -- land and get
+ * reused on future runs. See README.md's DATA SOURCES section. */
+static const char *kDtmSearchDirs[] = {
+    "/home/murf/wyodem/lidar",
 };
-#define DEFAULT_DTM_COUNT (int)(sizeof(kDefaultDtmPaths) / sizeof(kDefaultDtmPaths[0]))
+#define DTM_SEARCH_DIR_COUNT (int)(sizeof(kDtmSearchDirs) / sizeof(kDtmSearchDirs[0]))
 
+static char g_dtmCacheDir[600];
 static DtmSet g_dtm = { 0 };
 
 #define EYE_HEIGHT_M 1.7f
@@ -489,6 +501,7 @@ static void UpdateWalkCamera(WalkCamera *wc, double originLat, double originLon,
 
 static int RunWalkMode(double startLat, double startLon) {
     double originLat = startLat, originLon = startLon;
+    EnsureCoverageOrWarn(originLat, originLon);
     double originElevation = DtmSampleMeters(&g_dtm, originLat, originLon, 0);
     if (originElevation == DTM_NODATA) {
         fprintf(stderr, "terrain_viewer: (%.5f, %.5f) isn't covered by any loaded DTM file\n", startLat, startLon);
@@ -595,6 +608,14 @@ static int RunProfileMode(double lat1, double lon1, double heightFt1, double lat
     double bearing = initial_bearing(lat1, lon1, lat2, lon2);
     printf("Profile: (%.5f,%.5f)+%.0fft -> (%.5f,%.5f)+%.0fft, %.3f km, initial bearing %.1f deg\n",
            lat1, lon1, heightFt1, lat2, lon2, heightFt2, totalKm, bearing);
+
+    EnsureCoverageOrWarn(lat1, lon1);
+    EnsureCoverageOrWarn(lat2, lon2);
+    for (double frac = 0.15; frac < 1.0; frac += 0.15) {
+        double lat, lon;
+        destination_point(lat1, lon1, bearing, totalKm * frac, EARTH_RADIUS_KM, &lat, &lon);
+        EnsureCoverageOrWarn(lat, lon);
+    }
 
     double distKm[PROFILE_SAMPLES], elevM[PROFILE_SAMPLES];
     int haveData[PROFILE_SAMPLES];
@@ -909,6 +930,13 @@ static void ComputeViewshedRaster(Color *pixels, double towerLat, double towerLo
 }
 
 static int RunViewshedMode(double towerLat, double towerLon, double heightFt, double maxDistanceKm, const RfParams *rf, const char *screenshotPath) {
+    EnsureCoverageOrWarn(towerLat, towerLon);
+    for (int b = 0; b < 8; b++) {
+        double lat, lon;
+        destination_point(towerLat, towerLon, b * 45.0, maxDistanceKm, EARTH_RADIUS_KM, &lat, &lon);
+        EnsureCoverageOrWarn(lat, lon);
+    }
+
     double towerGround = DtmSampleMeters(&g_dtm, towerLat, towerLon, 0);
     if (towerGround == DTM_NODATA) {
         fprintf(stderr, "terrain_viewer: tower position (%.5f, %.5f) isn't covered by any loaded DTM file\n", towerLat, towerLon);
@@ -1002,15 +1030,41 @@ static int RunViewshedMode(double towerLat, double towerLon, double heightFt, do
     return 0;
 }
 
-static void LoadDefaultDtmSet(void) {
-    for (int i = 0; i < DEFAULT_DTM_COUNT; i++) {
-        if (DtmSetAddFile(&g_dtm, kDefaultDtmPaths[i]) != 0) {
-            fprintf(stderr, "terrain_viewer: failed to open %s -- see README-terrain.md\n", kDefaultDtmPaths[i]);
+/* Loads whatever *.tif files are already sitting in the search dirs --
+ * no network access, just whatever's local. Safe to call even if nothing's
+ * there yet (g_dtm just stays empty); EnsureDtmCoverage below is what
+ * actually fetches new tiles once a target location is known. */
+static void ScanDtmDirectories(void) {
+    const char *home = getenv("HOME");
+    snprintf(g_dtmCacheDir, sizeof(g_dtmCacheDir), "%s/dtm_cache", home ? home : ".");
+    mkdir(g_dtmCacheDir, 0755); /* ignore EEXIST -- fine if it's already there */
+
+    const char *dirs[DTM_SEARCH_DIR_COUNT + 1];
+    int dirCount = 0;
+    for (int i = 0; i < DTM_SEARCH_DIR_COUNT; i++) dirs[dirCount++] = kDtmSearchDirs[i];
+    dirs[dirCount++] = g_dtmCacheDir;
+
+    for (int d = 0; d < dirCount; d++) {
+        char pattern[700];
+        snprintf(pattern, sizeof(pattern), "%s/*.tif", dirs[d]);
+        glob_t g = { 0 };
+        if (glob(pattern, 0, NULL, &g) == 0) {
+            for (size_t i = 0; i < g.gl_pathc; i++) DtmSetAddFile(&g_dtm, g.gl_pathv[i]);
+            globfree(&g);
         }
     }
-    if (g_dtm.file_count == 0) {
-        fprintf(stderr, "terrain_viewer: no DTM files loaded, nothing to show\n");
-        exit(1);
+}
+
+/* Ensures a point is covered before it's sampled -- downloads a new tile
+ * (Wyoming lidar first, USGS 3DEP fallback) if nothing loaded already
+ * reaches there. TV_AUTO_DOWNLOAD=1 skips the interactive y/N confirmation
+ * (used by our own TV_SCREENSHOT headless testing, and anyone scripting
+ * this non-interactively). Not fatal on failure (e.g. the point is in the
+ * ocean or outside the US) -- just warns and leaves that spot as NODATA. */
+static void EnsureCoverageOrWarn(double lat, double lon) {
+    int autoConfirm = getenv("TV_AUTO_DOWNLOAD") != NULL;
+    if (EnsureDtmCoverage(&g_dtm, lat, lon, g_dtmCacheDir, autoConfirm) != 0) {
+        fprintf(stderr, "terrain_viewer: no DTM coverage at (%.5f, %.5f) -- that area will show as NODATA\n", lat, lon);
     }
 }
 
@@ -1024,7 +1078,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, usage, argv[0]);
             return 1;
         }
-        LoadDefaultDtmSet();
+        ScanDtmDirectories();
 
         int argi = 2;
         double lat1 = atof(argv[argi++]);
@@ -1059,7 +1113,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, usage, argv[0]);
             return 1;
         }
-        LoadDefaultDtmSet();
+        ScanDtmDirectories();
 
         int argi = 2;
         double lat = atof(argv[argi++]);
@@ -1095,7 +1149,7 @@ int main(int argc, char **argv) {
         return RunViewshedMode(lat, lon, heightFt, maxDistanceKm, &rf, screenshot);
     }
 
-    LoadDefaultDtmSet();
+    ScanDtmDirectories();
 
     double lat = kPlaces[0].lat, lon = kPlaces[0].lon;
     if (argc >= 2) {

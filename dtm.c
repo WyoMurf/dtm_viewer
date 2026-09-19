@@ -156,8 +156,8 @@ typedef struct {
     int valid;
     int level;
     uint32_t tile_col, tile_row;
-    int16_t *data;    /* level_info[level].tile_w * tile_h samples */
-    size_t capacity;  /* samples currently allocated in `data` */
+    unsigned char *data; /* level_info[level].tile_w * tile_h samples, bytes_per_sample bytes each -- raw bytes, not a typed pointer, since a DtmSet can mix uint16 (Wyoming) and float32 (USGS) files */
+    size_t capacity;     /* bytes currently allocated in `data` */
 } TileCacheSlot;
 
 typedef struct {
@@ -172,6 +172,8 @@ struct DtmFile {
     int num_levels;
     double lonMin, lonMax, latMin, latMax; /* level-independent: every overview covers the same geographic extent */
     double nodata;
+    int sample_is_float;  /* 0 = uint16 (Wyoming wyolidar), 1 = float32 (USGS 3DEP) -- see DtmSetAddFile */
+    int bytes_per_sample; /* 2 or 4, matching sample_is_float */
     LevelInfo level_info[DTM_MAX_LEVELS];
     TileCacheSlot cache[DTM_TILE_CACHE_SLOTS];
 };
@@ -251,12 +253,18 @@ int DtmSetAddFile(DtmSet *set, const char *path) {
         return -1;
     }
 
+    /* Two known layouts: Wyoming's wyolidar COGs (16-bit unsigned int
+     * meters) and USGS 3DEP's national tiles (32-bit float meters,
+     * confirmed against a real downloaded n45w109 1/3-arc-second tile --
+     * SampleFormat=3/IEEEFP, BitsPerSample=32). Both single-band. */
     uint16_t bits = 0, sampleFormat = 0, samplesPerPixel = 0;
     TIFFGetField(tiff, TIFFTAG_BITSPERSAMPLE, &bits);
     TIFFGetFieldDefaulted(tiff, TIFFTAG_SAMPLEFORMAT, &sampleFormat);
     TIFFGetFieldDefaulted(tiff, TIFFTAG_SAMPLESPERPIXEL, &samplesPerPixel);
-    if (bits != 16 || sampleFormat != SAMPLEFORMAT_UINT || samplesPerPixel != 1) {
-        fprintf(stderr, "dtm: %s: expected single-band 16-bit unsigned int (got %u bits, sampleFormat=%u, samples/pixel=%u) -- not a recognized DTM layout\n",
+    int isUint16 = (bits == 16 && sampleFormat == SAMPLEFORMAT_UINT);
+    int isFloat32 = (bits == 32 && sampleFormat == SAMPLEFORMAT_IEEEFP);
+    if (!(isUint16 || isFloat32) || samplesPerPixel != 1) {
+        fprintf(stderr, "dtm: %s: expected single-band 16-bit unsigned int or 32-bit float (got %u bits, sampleFormat=%u, samples/pixel=%u) -- not a recognized DTM layout\n",
                 path, bits, sampleFormat, samplesPerPixel);
         TIFFClose(tiff);
         return -1;
@@ -285,8 +293,13 @@ int DtmSetAddFile(DtmSet *set, const char *path) {
     f->lonMax = lonNW < lonSE ? lonSE : lonNW;
     f->latMin = latSE < latNW ? latSE : latNW;
     f->latMax = latSE < latNW ? latNW : latSE;
+    f->sample_is_float = isFloat32;
+    f->bytes_per_sample = isFloat32 ? 4 : 2;
 
-    f->nodata = hasNodata ? atof(nodataStr) : 65535.0; /* 65535 is the observed default across every DTM tile inspected so far */
+    /* Fallback defaults if a file is somehow missing its own NODATA tag --
+     * 65535 for Wyoming's uint16 tiles (observed default there), -999999
+     * for float32 (USGS 3DEP's own convention, confirmed on a real tile). */
+    f->nodata = hasNodata ? atof(nodataStr) : (isFloat32 ? -999999.0 : 65535.0);
 
     int ndirs = TIFFNumberOfDirectories(tiff);
     if (ndirs > DTM_MAX_LEVELS) ndirs = DTM_MAX_LEVELS;
@@ -321,9 +334,10 @@ void DtmSetClose(DtmSet *set) {
 /* Direct-mapped tile cache: a hash collision just means an eviction (an
  * extra re-decode next time), never incorrectness -- fine at the working
  * set a single walkthrough/profile query touches. */
-static int16_t *GetTile(DtmFile *f, int level, uint32_t tile_col, uint32_t tile_row) {
+static unsigned char *GetTile(DtmFile *f, int level, uint32_t tile_col, uint32_t tile_row) {
     LevelInfo *li = &f->level_info[level];
     size_t tile_samples = (size_t)li->tile_w * li->tile_h;
+    size_t tile_bytes = tile_samples * (size_t)f->bytes_per_sample;
 
     uint64_t h = (uint64_t)level * 1000003ull + (uint64_t)tile_col * 2654435761ull + (uint64_t)tile_row * 40503ull;
     TileCacheSlot *slot = &f->cache[h % DTM_TILE_CACHE_SLOTS];
@@ -332,11 +346,11 @@ static int16_t *GetTile(DtmFile *f, int level, uint32_t tile_col, uint32_t tile_
         return slot->data;
     }
 
-    if (slot->capacity < tile_samples) {
-        int16_t *bigger = realloc(slot->data, tile_samples * sizeof(int16_t));
+    if (slot->capacity < tile_bytes) {
+        unsigned char *bigger = realloc(slot->data, tile_bytes);
         if (!bigger) { fprintf(stderr, "dtm: out of memory growing a tile cache slot\n"); return NULL; }
         slot->data = bigger;
-        slot->capacity = tile_samples;
+        slot->capacity = tile_bytes;
     }
 
     if (f->current_dir != level) {
@@ -349,7 +363,7 @@ static int16_t *GetTile(DtmFile *f, int level, uint32_t tile_col, uint32_t tile_
 
     uint32_t x = tile_col * li->tile_w;
     uint32_t y = tile_row * li->tile_h;
-    tmsize_t bytesExpected = (tmsize_t)tile_samples * sizeof(int16_t);
+    tmsize_t bytesExpected = (tmsize_t)tile_bytes;
     tmsize_t bytesRead = TIFFReadTile(f->tiff, slot->data, x, y, 0, 0);
     if (bytesRead != bytesExpected) {
         fprintf(stderr, "dtm: %s: TIFFReadTile(level=%d, x=%u, y=%u) read %ld bytes, expected %ld\n",
@@ -372,14 +386,21 @@ static double SamplePixel(DtmFile *f, int level, uint32_t col, uint32_t row) {
     LevelInfo *li = &f->level_info[level];
     uint32_t tile_col = col / li->tile_w;
     uint32_t tile_row = row / li->tile_h;
-    int16_t *tile = GetTile(f, level, tile_col, tile_row);
+    unsigned char *tile = GetTile(f, level, tile_col, tile_row);
     if (!tile) return f->nodata;
     uint32_t localCol = col % li->tile_w;
     uint32_t localRow = row % li->tile_h;
-    /* The raster is SAMPLEFORMAT_UINT: reinterpret the same 16 bits unsigned
-     * (a plain int16_t read would turn values >= 32768, like the 65535
-     * nodata sentinel, negative). */
-    uint16_t raw = (uint16_t)tile[localRow * li->tile_w + localCol];
+    size_t sampleIdx = (size_t)localRow * li->tile_w + localCol;
+    if (f->sample_is_float) {
+        float raw;
+        memcpy(&raw, tile + sampleIdx * 4, 4);
+        return (double)raw;
+    }
+    /* uint16 (Wyoming): reinterpret the same 16 bits unsigned (a plain
+     * int16_t read would turn values >= 32768, like the 65535 nodata
+     * sentinel, negative). */
+    uint16_t raw;
+    memcpy(&raw, tile + sampleIdx * 2, 2);
     return (double)raw;
 }
 
@@ -445,6 +466,13 @@ double DtmSampleMeters(DtmSet *set, double lat, double lon, int level) {
         }
     }
     return DTM_NODATA;
+}
+
+int DtmSetCovers(const DtmSet *set, double lat, double lon) {
+    for (int i = 0; i < set->file_count; i++) {
+        if (FileCovers(set->files[i], lat, lon)) return 1;
+    }
+    return 0;
 }
 
 void DtmLonLatToLocalMeters(double originLat, double originLon, double lat, double lon, double *outEastM, double *outNorthM) {

@@ -58,6 +58,15 @@ void DtmSetClose(DtmSet *set);
 double DtmSampleMeters(DtmSet *set, double lat, double lon, int level);
 
 /*
+ * Whether some already-open file in `set` covers (lat, lon) geographically
+ * (bounding box only -- doesn't check for a NODATA void within it). Meant
+ * for callers deciding whether a *new* tile needs to be located and opened
+ * before sampling at a point (see dtm_fetch.h's EnsureDtmCoverage) -- much
+ * cheaper than a full DtmSampleMeters call when all you need is yes/no.
+ */
+int DtmSetCovers(const DtmSet *set, double lat, double lon);
+
+/*
  * Flat-earth tangent-plane projection centered at (originLat, originLon):
  * converts to/from meters east/north of that origin. Accurate to a few cm
  * per km at these latitudes -- meant for placing terrain within a
