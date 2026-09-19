@@ -20,7 +20,7 @@ extern "C" {
  */
 
 #define DTM_NODATA (-32768.0) /* returned when a point is outside every open file's coverage, or lands where the source raster itself is NODATA (65535 in these files) */
-#define DTM_MAX_FILES 8
+#define DTM_MAX_FILES 32 /* was 8 -- too easy to exceed once ScanDtmDirectories is loading a growing wyodem/lidar plus dtm_cache instead of 3 hardcoded tiles */
 
 typedef struct DtmFile DtmFile; /* opaque; see dtm.c */
 
