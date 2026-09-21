@@ -260,6 +260,15 @@ fatal: a fetch failure or zero mapped roads just mean no streets get drawn
 that run, not a crash. `TV_NO_ROADS=1` skips the fetch entirely (headless/
 offline testing).
 
+OSM's live API is the production editing backend, not a CDN built for
+heavy polling -- it can hand back a brief failure (rate limiting, a
+momentary hiccup) that moments later just works again with no change at
+all (observed directly: a real run failed outright, and the exact same
+URL succeeded seconds later). `FetchUrl` retries a failed fetch up to
+three times with a short backoff before actually giving up, so a
+transient blip costs a couple extra seconds rather than losing the whole
+overlay for that run.
+
 OSM's `/map` API refuses anything over 0.25 square degrees (confirmed
 directly: a real request that size gets a real HTTP 400, "The maximum
 bbox size is 0.250000") -- roughly a 20-22km viewshed radius at Wyoming's

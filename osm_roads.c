@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <unistd.h> /* sleep() -- see FetchUrl's retry */
 
 #include "osm_roads.h"
 
@@ -149,7 +150,7 @@ static void ParseOsmXml(const char *buf, size_t len, OsmRoadSet *out, LongSet *s
     out->way_count = (int)wayCount;
 }
 
-static char *FetchUrl(const char *url, size_t *outLen) {
+static char *FetchUrlOnce(const char *url, size_t *outLen) {
     char cmd[900];
     snprintf(cmd, sizeof(cmd), "curl -sf --max-time 30 '%s'", url);
     FILE *p = popen(cmd, "r");
@@ -165,6 +166,25 @@ static char *FetchUrl(const char *url, size_t *outLen) {
     if (rc != 0 || len == 0) { free(buf); return NULL; }
     if (outLen) *outLen = len;
     return buf;
+}
+
+/* OSM's live API is the production editing backend, not a CDN built for
+ * heavy polling -- it can hand back a brief failure (rate limiting, a
+ * momentary hiccup) that a few seconds later just works again. Confirmed
+ * in practice: a real run failed outright on the first attempt, and the
+ * exact same URL succeeded (HTTP 200) moments later with no code change
+ * at all. Three tries with a short backoff turns that kind of blip into
+ * "the overlay took an extra couple seconds" instead of "no roads". */
+static char *FetchUrl(const char *url, size_t *outLen) {
+    for (int attempt = 1; attempt <= 3; attempt++) {
+        char *result = FetchUrlOnce(url, outLen);
+        if (result) return result;
+        if (attempt < 3) {
+            fprintf(stderr, "osm_roads: fetch attempt %d failed, retrying...\n", attempt);
+            sleep(attempt); /* 1s, then 2s */
+        }
+    }
+    return NULL;
 }
 
 /* OSM's /map API refuses any request over 0.25 square degrees (confirmed
