@@ -46,13 +46,36 @@ static int CompareNodeRec(const void *a, const void *b) {
     return (ia > ib) - (ia < ib);
 }
 
+static int CompareLong(const void *a, const void *b) {
+    long ia = *(const long *)a, ib = *(const long *)b;
+    return (ia > ib) - (ia < ib);
+}
+
+/* Tracks which way ids have already been added to the accumulating
+ * OsmRoadSet across multiple tile fetches (see the tiling comment on
+ * OsmRoadsFetch) -- a way with nodes on both sides of a tile boundary
+ * comes back in full from EVERY tile it touches, so without this a large
+ * request would draw (and store) the same road several times over. */
+typedef struct { long *ids; size_t count, cap; } LongSet;
+
+static int LongSetContains(const LongSet *s, long id) {
+    return bsearch(&id, s->ids, s->count, sizeof(long), CompareLong) != NULL;
+}
+static void LongSetAdd(LongSet *s, long id) {
+    if (s->count == s->cap) { s->cap = s->cap ? s->cap * 2 : 256; s->ids = realloc(s->ids, s->cap * sizeof(long)); }
+    s->ids[s->count++] = id;
+    qsort(s->ids, s->count, sizeof(long), CompareLong); /* small/infrequent enough (once per way, not per lookup) that re-sorting here beats a real insert-sorted implementation for how little code it takes */
+}
+
 /* Hand-rolled, not a general XML parser -- OSM's /map API output is
  * regular enough (bounds, then every referenced node, then every way)
  * that two linear scans (collect nodes, then resolve each way's <nd
  * ref>s against them) is simpler and lighter than pulling in a real XML
  * library for this one call site, matching how dtm.c already hand-parses
- * GeoTIFF tags instead of depending on more of libtiff than TIFFOpen. */
-static void ParseOsmXml(const char *buf, size_t len, OsmRoadSet *out) {
+ * GeoTIFF tags instead of depending on more of libtiff than TIFFOpen.
+ * Appends into `out`/`seenWays` rather than resetting them, so multiple
+ * tile fetches can accumulate into one combined result. */
+static void ParseOsmXml(const char *buf, size_t len, OsmRoadSet *out, LongSet *seenWays) {
     const char *end = buf + len;
 
     size_t nodeCap = 4096, nodeCount = 0;
@@ -71,8 +94,10 @@ static void ParseOsmXml(const char *buf, size_t len, OsmRoadSet *out) {
     }
     qsort(nodes, nodeCount, sizeof(OsmNodeRec), CompareNodeRec);
 
-    size_t wayCap = 256, wayCount = 0;
-    OsmWay *ways = malloc(wayCap * sizeof(OsmWay));
+    size_t wayCount = (size_t)out->way_count;
+    size_t wayCap = wayCount > 0 ? wayCount : 256;
+    while (wayCap < wayCount) wayCap *= 2;
+    OsmWay *ways = out->ways ? realloc(out->ways, wayCap * sizeof(OsmWay)) : malloc(wayCap * sizeof(OsmWay));
     p = buf;
     while ((p = BoundedFind(p, end, "<way ")) != NULL) {
         const char *openEnd = BoundedFind(p, end, ">");
@@ -85,7 +110,10 @@ static void ParseOsmXml(const char *buf, size_t len, OsmRoadSet *out) {
             blockEnd = closeTag;
         }
 
-        if (!selfClosed && BoundedFind(openEnd, blockEnd, "<tag k=\"highway\"")) {
+        long wayId = 0;
+        int alreadySeen = selfClosed || !GetAttrLong(p, openEnd, "id", &wayId) || LongSetContains(seenWays, wayId);
+
+        if (!alreadySeen && BoundedFind(openEnd, blockEnd, "<tag k=\"highway\"")) {
             size_t refCap = 16, refCount = 0;
             double *lats = malloc(refCap * sizeof(double));
             double *lons = malloc(refCap * sizeof(double));
@@ -108,6 +136,7 @@ static void ParseOsmXml(const char *buf, size_t len, OsmRoadSet *out) {
                 if (wayCount == wayCap) { wayCap *= 2; ways = realloc(ways, wayCap * sizeof(OsmWay)); }
                 ways[wayCount].lat = lats; ways[wayCount].lon = lons; ways[wayCount].count = (int)refCount;
                 wayCount++;
+                LongSetAdd(seenWays, wayId);
             } else {
                 free(lats); free(lons);
             }
@@ -138,34 +167,70 @@ static char *FetchUrl(const char *url, size_t *outLen) {
     return buf;
 }
 
+/* OSM's /map API refuses any request over 0.25 square degrees (confirmed
+ * directly: a real 25km-radius request got a real HTTP 400, "The maximum
+ * bbox size is 0.250000") -- roughly a 20-22km viewshed radius at
+ * Wyoming's latitude. TILE_TARGET_DEG2 stays comfortably under that so a
+ * bigger request just gets split into an N x N grid of sub-boxes, each
+ * fetched and parsed (with LongSet catching ways that straddle a tile
+ * boundary and would otherwise come back -- in full -- from every tile
+ * they touch) into one combined OsmRoadSet, rather than refusing to draw
+ * roads at all past ~20km. */
+#define TILE_TARGET_DEG2 0.20
+
+static int FetchOneTile(double minLon, double minLat, double maxLon, double maxLat, OsmRoadSet *out, LongSet *seenWays) {
+    char url[400];
+    snprintf(url, sizeof(url), "https://api.openstreetmap.org/api/0.6/map?bbox=%.6f,%.6f,%.6f,%.6f", minLon, minLat, maxLon, maxLat);
+    size_t len = 0;
+    char *xml = FetchUrl(url, &len);
+    if (!xml) return -1;
+    ParseOsmXml(xml, len, out, seenWays);
+    free(xml);
+    return 0;
+}
+
 int OsmRoadsFetch(double centerLat, double centerLon, double radiusKm, OsmRoadSet *out) {
     out->ways = NULL;
     out->way_count = 0;
+    LongSet seenWays = { 0 };
 
     /* +5% pad so the requested circle is fully inside the fetched box. */
     double dLat = (radiusKm / 111.32) * 1.05;
     double dLon = (radiusKm / (111.32 * cos(centerLat * M_PI / 180.0))) * 1.05;
     double minLat = centerLat - dLat, maxLat = centerLat + dLat;
     double minLon = centerLon - dLon, maxLon = centerLon + dLon;
+    double area = (maxLat - minLat) * (maxLon - minLon);
 
-    if ((maxLat - minLat) * (maxLon - minLon) > 0.24) {
-        fprintf(stderr, "osm_roads: %.1fkm radius needs a bounding box too big for OSM's /map API (limit ~0.25 sq deg) -- skipping road overlay\n", radiusKm);
-        return -1;
+    int n = (int)ceil(sqrt(area / TILE_TARGET_DEG2));
+    if (n < 1) n = 1;
+    if (n > 6) { /* 6x6 already covers an ~80km radius -- past that, cap it rather than firing off dozens of sequential requests */
+        fprintf(stderr, "osm_roads: %.1fkm radius is huge -- capping the road overlay to a 6x6 tile grid (partial coverage near the edges)\n", radiusKm);
+        n = 6;
     }
 
-    char url[400];
-    snprintf(url, sizeof(url), "https://api.openstreetmap.org/api/0.6/map?bbox=%.6f,%.6f,%.6f,%.6f", minLon, minLat, maxLon, maxLat);
+    if (n > 1) printf("osm_roads: fetching street data for the overlay (%dx%d tiles, area too big for one request)...\n", n, n);
+    else printf("osm_roads: fetching street data for the overlay...\n");
 
-    printf("osm_roads: fetching street data for the overlay...\n");
-    size_t len = 0;
-    char *xml = FetchUrl(url, &len);
-    if (!xml) {
-        fprintf(stderr, "osm_roads: fetch failed -- skipping road overlay\n");
-        return -1;
+    int okCount = 0;
+    for (int iy = 0; iy < n; iy++) {
+        double tMinLat = minLat + (maxLat - minLat) * iy / n;
+        double tMaxLat = minLat + (maxLat - minLat) * (iy + 1) / n;
+        for (int ix = 0; ix < n; ix++) {
+            double tMinLon = minLon + (maxLon - minLon) * ix / n;
+            double tMaxLon = minLon + (maxLon - minLon) * (ix + 1) / n;
+            if (FetchOneTile(tMinLon, tMinLat, tMaxLon, tMaxLat, out, &seenWays) == 0) okCount++;
+        }
     }
 
-    ParseOsmXml(xml, len, out);
-    free(xml);
+    free(seenWays.ids);
+
+    if (okCount == 0) {
+        fprintf(stderr, "osm_roads: all %d tile fetch(es) failed -- skipping road overlay\n", n * n);
+        return -1;
+    }
+    if (okCount < n * n) {
+        fprintf(stderr, "osm_roads: %d of %d tiles failed to fetch -- showing partial road coverage\n", n * n - okCount, n * n);
+    }
     printf("osm_roads: %d road segments found\n", out->way_count);
     return 0;
 }

@@ -256,10 +256,21 @@ XML parser, matching how `dtm.c` already hand-parses GeoTIFF tags instead
 of depending on more of libtiff than it needs), and draws each way as a
 thin line in the same tower-centered, north-up local-meters projection
 `ComputeViewshedRaster` used for the coverage colors. Best-effort and never
-fatal: a fetch failure, zero mapped roads, or a `maxDistanceKm` whose
-bounding box exceeds the API's ~0.25-square-degree limit all just mean no
-streets get drawn that run, not a crash. `TV_NO_ROADS=1` skips the fetch
-entirely (headless/offline testing).
+fatal: a fetch failure or zero mapped roads just mean no streets get drawn
+that run, not a crash. `TV_NO_ROADS=1` skips the fetch entirely (headless/
+offline testing).
+
+OSM's `/map` API refuses anything over 0.25 square degrees (confirmed
+directly: a real request that size gets a real HTTP 400, "The maximum
+bbox size is 0.250000") -- roughly a 20-22km viewshed radius at Wyoming's
+latitude. Past that, the request is split into an N x N grid of sub-boxes
+that each stay comfortably under the limit, fetched and merged into one
+combined result; a way whose nodes straddle a tile boundary comes back in
+full from every tile it touches, so `osm_roads.c` tracks already-added way
+ids across tiles to avoid drawing (and storing) the same road several
+times over. Capped at a 6x6 grid (~80km radius) so a huge radius can't
+fire off dozens of sequential requests -- a few failed tiles among many
+just means partial coverage near the edges, not a lost overlay.
 
 SCOUTING TOOLS (`make probe_points los_check`):
 
