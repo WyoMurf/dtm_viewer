@@ -204,9 +204,17 @@ the binary map with a continuous one: free-space path loss (`20*log10(d_km)
 (ITU-R P.526 -- same family as `--profile`'s curvature formula) computed
 from the single worst obstruction found so far along each ray, relative to
 the signal's own Fresnel-zone geometry at that point. Color is a red
-(weak, right at the sensitivity threshold) -> yellow -> green (strong,
-40dB+ of margin) ramp; gray means the point doesn't reach the sensitivity
-threshold at all. `--erp` is watts (matching how FCC license records
+(weak, right at the sensitivity threshold) -> yellow -> green (strong)
+ramp; gray means the point doesn't reach the sensitivity threshold at all.
+The green end of the ramp auto-scales to whatever the strongest margin
+actually computed for that run turns out to be (`ComputeViewshedRaster`
+does the full sweep into a margin buffer first, then colors it against
+that discovered ceiling) rather than a fixed dB span -- a flat 0-40dB
+range washes out to solid green the moment a scenario has more than 40dB
+of headroom anywhere, which is most of the map for a strong transmitter
+at short range (e.g. 140W at 1.5km leaves ~59dB of margin on a clear
+path). The color bar's own printed endpoints always show the true dBm
+range in play for that run. `--erp` is watts (matching how FCC license records
 usually report it, as ERP referenced to a dipole); it's converted to EIRP
 internally (`+2.15 dB`) since that's what the path-loss math needs. This
 tends to show meaningfully more coverage than the plain LOS map, because

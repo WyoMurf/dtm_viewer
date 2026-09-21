@@ -830,9 +830,9 @@ static double KnifeEdgeDiffractionLossDb(double hM, double d1Km, double d2Km, do
  * gray if it doesn't reach threshold at all (no usable coverage), else a
  * red(weak, right at threshold)-yellow-green(strong, 40dB+ of margin)
  * ramp, the same shape a real carrier coverage map uses. */
-static Color SignalColor(double marginDb) {
+static Color SignalColor(double marginDb, double ceilingDb) {
     if (marginDb < 0.0) return (Color){ 140, 140, 140, 255 };
-    double t = marginDb / 40.0;
+    double t = marginDb / ceilingDb;
     if (t > 1.0) t = 1.0;
     Color weak = (Color){ 205, 60, 40, 255 }, mid = (Color){ 230, 200, 40, 255 }, strong = (Color){ 40, 140, 60, 255 };
     Color a, b; double u;
@@ -859,7 +859,10 @@ static Color SignalColor(double marginDb) {
  * its OWN terrain and thereby suppress everything behind it. Standard
  * "observer offset / target offset" GIS viewshed practice, just applied
  * along one ray at a time. */
-static void ComputeViewshedRaster(Color *pixels, double towerLat, double towerLon, double towerElevM, double maxDistanceKm, const RfParams *rf) {
+/* Returns the ceiling (dB above sensitivity) the RF color ramp actually
+ * used -- see the big comment below for why this can't just be a fixed
+ * 40dB. Meaningless (0.0) when rf->enabled is false. */
+static double ComputeViewshedRaster(Color *pixels, double towerLat, double towerLon, double towerElevM, double maxDistanceKm, const RfParams *rf) {
     double effectiveRadiusKm = EARTH_RADIUS_KM * VISIBILITY_REFRACTION_K;
     double effectiveRadiusM = effectiveRadiusKm * 1000.0;
     double metersPerPixel = (maxDistanceKm * 2000.0) / VIEWSHED_MAP_PX;
@@ -875,6 +878,25 @@ static void ComputeViewshedRaster(Color *pixels, double towerLat, double towerLo
 
     Color visibleColor = (Color){ 70, 160, 90, 255 };
     Color blockedColor = (Color){ 195, 60, 50, 255 };
+
+    /* A fixed 0-40dB ramp (the old behavior) saturates solid green the
+     * moment a scenario has more than 40dB of link margin anywhere --
+     * which is most of the map for a high-power transmitter at short
+     * range (e.g. 140W at 1.5km leaves ~59dB of margin over a clear
+     * path, versus the 40dB ceiling). So: run the whole sweep storing
+     * each point's raw margin into `margin[]` instead of a color, track
+     * the strongest margin actually seen, then color every point in a
+     * second pass against THAT ceiling -- the full red-to-green range is
+     * always in play, at whatever scale this particular tower/power/
+     * distance combination actually produces. NAN marks a pixel no
+     * bearing ever reached (stays whatever `pixels[]` was pre-filled
+     * with, e.g. the "not computed" background). */
+    float *margin = NULL;
+    double maxMarginSeen = -1e18;
+    if (rf->enabled) {
+        margin = malloc(sizeof(float) * VIEWSHED_MAP_PX * VIEWSHED_MAP_PX);
+        for (int i = 0; i < VIEWSHED_MAP_PX * VIEWSHED_MAP_PX; i++) margin[i] = NAN;
+    }
 
     for (int b = 0; b < bearingCount; b++) {
         double bearing = 360.0 * b / bearingCount;
@@ -896,7 +918,8 @@ static void ComputeViewshedRaster(Color *pixels, double towerLat, double towerLo
             double receiverAngle = (rxElevM - towerElevM) / dM - dM / (2.0 * effectiveRadiusM);
             int visible = receiverAngle > maxAngle;
 
-            Color c;
+            Color c = blockedColor;
+            double thisMargin = 0.0;
             if (rf->enabled) {
                 double diffLossDb = 0.0;
                 if (obstDistKm > 0.0) {
@@ -906,7 +929,8 @@ static void ComputeViewshedRaster(Color *pixels, double towerLat, double towerLo
                     diffLossDb = KnifeEdgeDiffractionLossDb(obstElevM - lineElevAtObstM, d1, d2, rf->freqMHz);
                 }
                 double prDbm = rf->eirpDbm - FreeSpacePathLossDb(d, rf->freqMHz) - diffLossDb;
-                c = SignalColor(prDbm - rf->sensDbm);
+                thisMargin = prDbm - rf->sensDbm;
+                if (thisMargin > maxMarginSeen) maxMarginSeen = thisMargin;
             } else {
                 c = visible ? visibleColor : blockedColor;
             }
@@ -923,11 +947,22 @@ static void ComputeViewshedRaster(Color *pixels, double towerLat, double towerLo
                 for (int ox = -1; ox <= 1; ox++) {
                     int xx = px + ox;
                     if (xx < 0 || xx >= VIEWSHED_MAP_PX) continue;
-                    pixels[yy * VIEWSHED_MAP_PX + xx] = c;
+                    if (rf->enabled) margin[yy * VIEWSHED_MAP_PX + xx] = (float)thisMargin;
+                    else pixels[yy * VIEWSHED_MAP_PX + xx] = c;
                 }
             }
         }
     }
+
+    if (!rf->enabled) return 0.0;
+
+    double ceilingDb = maxMarginSeen > 3.0 ? maxMarginSeen : 40.0; /* degenerate "nothing has signal" case -- scale doesn't matter, the map's all gray anyway */
+    for (int i = 0; i < VIEWSHED_MAP_PX * VIEWSHED_MAP_PX; i++) {
+        if (isnan(margin[i])) continue; /* never reached by any bearing -- leave the pre-filled background */
+        pixels[i] = SignalColor(margin[i], ceilingDb);
+    }
+    free(margin);
+    return ceilingDb;
 }
 
 static void DrawPixelLine(Color *pixels, int w, int h, int x0, int y0, int x1, int y1, Color c) {
@@ -997,7 +1032,8 @@ static int RunViewshedMode(double towerLat, double towerLon, double heightFt, do
     for (int i = 0; i < VIEWSHED_MAP_PX * VIEWSHED_MAP_PX; i++) pixels[i] = (Color){ 224, 224, 224, 255 };
 
     printf("Computing viewshed raster...\n");
-    ComputeViewshedRaster(pixels, towerLat, towerLon, towerElevM, maxDistanceKm, rf);
+    double ceilingDb = ComputeViewshedRaster(pixels, towerLat, towerLon, towerElevM, maxDistanceKm, rf);
+    if (rf->enabled) printf("Strongest margin in view: %.1f dB above sensitivity -- color scale set to match\n", ceilingDb);
     printf("Done.\n");
 
     DrawRoadOverlay(pixels, towerLat, towerLon, maxDistanceKm);
@@ -1043,12 +1079,12 @@ static int RunViewshedMode(double towerLat, double towerLon, double heightFt, do
 
             int barX = marginL, barY = marginT + VIEWSHED_MAP_PX + 8, barW = 260, barH = 14;
             for (int i = 0; i < barW; i++) {
-                double marginDb = 40.0 * i / (barW - 1);
-                DrawLine(barX + i, barY, barX + i, barY + barH, SignalColor(marginDb));
+                double marginDb = ceilingDb * i / (barW - 1);
+                DrawLine(barX + i, barY, barX + i, barY + barH, SignalColor(marginDb, ceilingDb));
             }
             DrawRectangleLines(barX, barY, barW, barH, DARKGRAY);
             DrawText(TextFormat("%.0f dBm", rf->sensDbm), barX, barY + barH + 2, 12, DARKGRAY);
-            DrawText(TextFormat("%.0f dBm", rf->sensDbm + 40.0), barX + barW - 55, barY + barH + 2, 12, DARKGRAY);
+            DrawText(TextFormat("%.0f dBm", rf->sensDbm + ceilingDb), barX + barW - 55, barY + barH + 2, 12, DARKGRAY);
             DrawRectangle(barX + barW + 20, barY, 14, 14, (Color){ 140, 140, 140, 255 });
             DrawText("no coverage", barX + barW + 40, barY, 14, DARKGRAY);
             DrawLine(barX + barW + 150, barY + 7, barX + barW + 164, barY + 7, (Color){ 30, 30, 30, 255 });
