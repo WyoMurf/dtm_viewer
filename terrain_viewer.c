@@ -604,6 +604,19 @@ static int RunWalkMode(double startLat, double startLon) {
 
 #define FEET_TO_METERS 0.3048
 
+/* Parses a +<number>[m|f] height argument (e.g. "+195", "+50m", "+30f") into
+ * feet above ground -- 'm'/'M' means the number given is meters, 'f'/'F' or
+ * no suffix means feet, matching this project's original convention (kept
+ * as the default since it predates the unit suffix). Internally everything
+ * still runs in feet, same as before, so this is purely an input-parsing
+ * change -- display/math elsewhere in the file is untouched. */
+static double ParseHeightFeetArg(const char *arg) {
+    char *end;
+    double value = strtod(arg + 1, &end); /* +1 skips the leading '+' */
+    if (*end == 'm' || *end == 'M') return value / FEET_TO_METERS;
+    return value;
+}
+
 static int RunProfileMode(double lat1, double lon1, double heightFt1, double lat2, double lon2, double heightFt2, const char *screenshotPath) {
     double totalKm = haversine_distance(lat1, lon1, lat2, lon2, EARTH_RADIUS_KM);
     double bearing = initial_bearing(lat1, lon1, lat2, lon2);
@@ -1155,10 +1168,12 @@ static void EnsureCoverageOrWarn(double lat, double lon) {
 
 int main(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "--profile") == 0) {
-        static const char *usage = "usage: %s --profile lat1 lon1 [+heightFt1] lat2 lon2 [+heightFt2] [screenshot.png]\n"
-                                    "  +heightFt is an optional mast/tower height in feet above ground at that\n"
-                                    "  point (e.g. a cell tower's antenna height) -- must start with '+', or\n"
-                                    "  it's read as the next lat/lon instead; 0 (ground level) if omitted.\n";
+        static const char *usage = "usage: %s --profile lat1 lon1 [+height1] lat2 lon2 [+height2] [screenshot.png]\n"
+                                    "  +height is an optional mast/tower height above ground at that point\n"
+                                    "  (e.g. a cell tower's antenna height) -- must start with '+', or it's\n"
+                                    "  read as the next lat/lon instead; 0 (ground level) if omitted. Add an\n"
+                                    "  'm' suffix for meters (e.g. +30m) or 'f' for feet (e.g. +100f); no\n"
+                                    "  suffix defaults to feet (e.g. +100 == +100f).\n";
         if (argc < 6) {
             fprintf(stderr, usage, argv[0]);
             return 1;
@@ -1169,7 +1184,7 @@ int main(int argc, char **argv) {
         double lat1 = atof(argv[argi++]);
         double lon1 = atof(argv[argi++]);
         double heightFt1 = 0.0;
-        if (argi < argc && argv[argi][0] == '+') heightFt1 = atof(argv[argi++]);
+        if (argi < argc && argv[argi][0] == '+') heightFt1 = ParseHeightFeetArg(argv[argi++]);
 
         if (argi + 1 >= argc) {
             fprintf(stderr, usage, argv[0]);
@@ -1178,17 +1193,19 @@ int main(int argc, char **argv) {
         double lat2 = atof(argv[argi++]);
         double lon2 = atof(argv[argi++]);
         double heightFt2 = 0.0;
-        if (argi < argc && argv[argi][0] == '+') heightFt2 = atof(argv[argi++]);
+        if (argi < argc && argv[argi][0] == '+') heightFt2 = ParseHeightFeetArg(argv[argi++]);
 
         const char *screenshot = (argi < argc) ? argv[argi] : getenv("TV_SCREENSHOT");
         return RunProfileMode(lat1, lon1, heightFt1, lat2, lon2, heightFt2, screenshot);
     }
 
     if (argc >= 2 && strcmp(argv[1], "--viewshed") == 0) {
-        static const char *usage = "usage: %s --viewshed lat lon [+heightFt] maxDistanceKm [options] [screenshot.png]\n"
-                                    "  +heightFt is an optional antenna height in feet above ground at the\n"
-                                    "  tower -- must start with '+', or it's read as maxDistanceKm instead;\n"
-                                    "  0 (ground level) if omitted. maxDistanceKm is the coverage radius to map.\n"
+        static const char *usage = "usage: %s --viewshed lat lon [+height] maxDistanceKm [options] [screenshot.png]\n"
+                                    "  +height is an optional antenna height above ground at the tower --\n"
+                                    "  must start with '+', or it's read as maxDistanceKm instead; 0 (ground\n"
+                                    "  level) if omitted. Add an 'm' suffix for meters (e.g. +10m) or 'f' for\n"
+                                    "  feet (e.g. +30f); no suffix defaults to feet (e.g. +30 == +30f).\n"
+                                    "  maxDistanceKm is the coverage radius to map.\n"
                                     "  Options (all optional, any order, after maxDistanceKm):\n"
                                     "    --erp watts    transmitter ERP in watts -- ALSO enables the RF signal-\n"
                                     "                   strength model (default: off, pure geometric LOS map)\n"
@@ -1204,7 +1221,7 @@ int main(int argc, char **argv) {
         double lat = atof(argv[argi++]);
         double lon = atof(argv[argi++]);
         double heightFt = 0.0;
-        if (argi < argc && argv[argi][0] == '+') heightFt = atof(argv[argi++]);
+        if (argi < argc && argv[argi][0] == '+') heightFt = ParseHeightFeetArg(argv[argi++]);
 
         if (argi >= argc) {
             fprintf(stderr, usage, argv[0]);

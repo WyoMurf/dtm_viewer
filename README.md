@@ -144,15 +144,19 @@ otherwise drift non-deterministically).
 
 RUNNING -- elevation profile mode:
 
-    ./terrain_viewer --profile lat1 lon1 [+heightFt1] lat2 lon2 [+heightFt2] [screenshot.png]
+    ./terrain_viewer --profile lat1 lon1 [+height1] lat2 lon2 [+height2] [screenshot.png]
 
-`+heightFt` is an optional mast/tower height in feet above ground at that
+`+height` is an optional mast/tower height above ground at that
 endpoint -- e.g. a cell tower's antenna height, not a person standing
 there -- defaulting to 0 (ground level) when omitted. It must start with
 `+` (a bare number there is parsed as the next lat/lon instead), which
-also means it can't disambiguate a `+heightFt` from a positive
+also means it can't disambiguate a `+height` from a positive
 (eastern-hemisphere) longitude typed with an explicit `+` -- not a
 concern for anything in Wyoming, where longitude is always negative.
+Add an `m` suffix for meters (`+30m`) or `f` for feet (`+100f`, case-
+insensitive either way); no suffix defaults to feet (`+100` == `+100f`),
+matching this project's original convention from before unit suffixes
+existed.
 Endpoint markers get a short vertical mast line up from the ground when a
 height is given, and the "A"/"B" labels show ground/tower/total elevation
 separately (e.g. `1524m ground + 100ft = 1554m`) -- the tower height gets
@@ -176,7 +180,7 @@ see DATA SOURCES above) show as a gap in the terrain line (NODATA).
 
 RUNNING -- viewshed mode:
 
-    ./terrain_viewer --viewshed lat lon [+heightFt] maxDistanceKm [options] [screenshot.png]
+    ./terrain_viewer --viewshed lat lon [+height] maxDistanceKm [options] [screenshot.png]
 
     Options (any order, after maxDistanceKm):
       --erp watts    transmitter ERP in watts -- ALSO enables the RF
@@ -185,8 +189,8 @@ RUNNING -- viewshed mode:
       --freq MHz     carrier frequency in MHz (default: 869, cellular Band A)
       --sens dBm     receiver sensitivity threshold (default: -100)
 
-Given a tower's position and antenna height (`+heightFt`, feet above
-ground, 0 if omitted -- same `+` convention as `--profile`), rasterizes a
+Given a tower's position and antenna height (`+height`, same `+`/unit-
+suffix convention as `--profile`, 0 if omitted), rasterizes a
 top-down map (north up, tower at center) of coverage within
 `maxDistanceKm`. Distance rings mark 25/50/75/100% of `maxDistanceKm`.
 
@@ -301,7 +305,8 @@ which ones actually have useful sightlines.
     ./los_check file.tif [file.tif ...]
 
 Reads `lat1,lon1,h1ft,lat2,lon2,h2ft` per line (h in feet above ground at
-each point, matching `--profile`'s `+heightFt` convention), prints
+each point -- always feet here, no `m`/`f` suffix like `--profile`'s
+`+height` args take, since this is a plain CSV batch format), prints
 `lat1,lon1,lat2,lon2,CLEAR,marginM` or `...,BLOCKED,marginM,atKm` --
 reuses the exact same curvature/refraction sightline math `--profile`
 plots (worst point along the path relative to the direct line, not just a
