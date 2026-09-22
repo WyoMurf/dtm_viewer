@@ -372,6 +372,16 @@ per candidate.
 2.7-3.0m margin), with bend angles from 75-129 deg -- comfortably clear
 of the grazing problem. Required plate size peaks at 1.23 m^2 (Target 3, the longest/worst-angled leg); every other address needs less.
 
+A backup was checked the same way ~250m down the same street: the
+Meeteetse Fire District lot (44.157664,-108.870856) also clears every
+target, with bend angles 69-130 deg and a slightly *smaller* worst-case
+plate (1.16 m^2, still Target 3), but needs a taller 50ft mast to get
+there (three of the seven addresses are marginally blocked at 40ft, same
+as the Sheriff's site's own initial 30ft check). RF-wise the two sites
+are essentially interchangeable -- pick whichever turns out easier on the
+ground (pole placement, existing infrastructure to tie into, county
+sign-off).
+
 **Construction.** At 869 MHz (cellular Band A, lambda ~345mm), flatness
 only needs to hold to about lambda/16-lambda/20 (~17-22mm) -- the
 Rayleigh criterion used for reflector-antenna surfaces generally, and
@@ -399,9 +409,13 @@ true north; converting to a compass heading needs the local magnetic
 declination (9.92 deg E at this exact site as of September 2026, per
 NOAA/NCEI's WMM-2025 calculator -- https://www.ngdc.noaa.gov/geomag/calculators/magcalc.shtml,
 drifting about -0.09 deg/year here), giving **~150 deg on a hand
-compass**. Verify with a real signal meter at a few target addresses
-once mounted -- this estimate is a starting point for the physical
-install, not a substitute for field tuning.
+compass**. The Fire District backup works out nearly identically --
+tower bearing ~114 deg, target bearings 148-178 deg, compromise **159 deg
+true**, and the same 9.92 deg E declination (only 250m away) gives **~149
+deg magnetic** -- unsurprising given how close the two sites are to each
+other. Verify with a real signal meter at a few target addresses once
+mounted, whichever site is used -- this estimate is a starting point for
+the physical install, not a substitute for field tuning.
 
 **Not covered by this tool**: structural/lightning-protection grounding
 for the mast and panel (NEC Article 810 territory, especially relevant
