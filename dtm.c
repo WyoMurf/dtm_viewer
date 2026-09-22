@@ -29,9 +29,19 @@
  * pyramid levels, and the actual LZW-compressed pixel data) still goes
  * through libtiff via TIFF* below, which handles those tags natively.
  */
-#define DTM_TAG_GEOPIXELSCALE 33550
-#define DTM_TAG_GEOTIEPOINTS  33922
-#define DTM_TAG_GDAL_NODATA   42113
+#define DTM_TAG_GEOPIXELSCALE   33550
+#define DTM_TAG_GEOTIEPOINTS    33922
+#define DTM_TAG_GDAL_NODATA     42113
+#define DTM_TAG_GEOKEYDIRECTORY 34735
+
+/* GeoKey IDs read out of GeoKeyDirectoryTag -- see ReadGeoTagsRaw. Only
+ * the two needed to tell "geographic lat/lon" (Wyoming, USGS 1/3 arc-
+ * second) apart from "projected UTM" (USGS's 1-meter DEM -- confirmed
+ * directly by parsing a real downloaded tile's GeoKeyDirectoryTag: KeyID
+ * 1024=1 (ModelTypeProjected) and KeyID 3072=26911 (EPSG:26911, NAD83 /
+ * UTM zone 11N) for a tile covering 38.5N,116.5W in Nevada). */
+#define GEOKEY_GTMODELTYPE    1024 /* 1 = Projected, 2 = Geographic */
+#define GEOKEY_PROJECTEDCSTYPE 3072 /* EPSG code when GTModelType == 1 */
 
 typedef struct {
     FILE *fp;
@@ -62,18 +72,25 @@ static double RawReadDouble(RawTiff *rt) {
     return d;
 }
 
-/* Reads just tags 33550/33922/42113 out of IFD 0 (the geo tags are the same
+/* Reads tags 33550/33922/42113/34735 out of IFD 0 (the geo tags are the same
  * across every overview level, so there's no need to look past directory 0).
  * outScale/outTiepoint must each have room for 6 doubles; *outScaleCount/
  * *outTiepointCount report how many were actually present. outNodata is a
  * caller-supplied buffer of outNodataSize bytes for the ASCII value (left
- * untouched, with *outHasNodata set to 0, if the tag isn't present). */
+ * untouched, with *outHasNodata set to 0, if the tag isn't present).
+ * *outIsProjected is set to 1 if GeoKeyDirectoryTag's GTModelTypeGeoKey
+ * (1024) says Projected rather than Geographic, and *outEpsg to whatever
+ * ProjectedCSTypeGeoKey (3072) gave in that case (0 otherwise) -- see
+ * DtmSetAddFile's UTM handling. */
 static int ReadGeoTagsRaw(const char *path, double *outScale, int *outScaleCount,
                            double *outTiepoint, int *outTiepointCount,
-                           char *outNodata, size_t outNodataSize, int *outHasNodata) {
+                           char *outNodata, size_t outNodataSize, int *outHasNodata,
+                           int *outIsProjected, int *outEpsg) {
     *outScaleCount = 0;
     *outTiepointCount = 0;
     *outHasNodata = 0;
+    *outIsProjected = 0;
+    *outEpsg = 0;
 
     FILE *fp = fopen(path, "rb");
     if (!fp) return -1;
@@ -111,9 +128,9 @@ static int ReadGeoTagsRaw(const char *path, double *outScale, int *outScaleCount
         uint16_t type = (uint16_t)RawReadUint(&rt, 2);
         uint64_t count = RawReadUint(&rt, count_field_bytes);
 
-        if (tag != DTM_TAG_GEOPIXELSCALE && tag != DTM_TAG_GEOTIEPOINTS && tag != DTM_TAG_GDAL_NODATA) continue;
+        if (tag != DTM_TAG_GEOPIXELSCALE && tag != DTM_TAG_GEOTIEPOINTS && tag != DTM_TAG_GDAL_NODATA && tag != DTM_TAG_GEOKEYDIRECTORY) continue;
 
-        int type_size = (type == 2) ? 1 : (type == 12) ? 8 : 0; /* only ASCII and DOUBLE matter for our 3 tags */
+        int type_size = (type == 2) ? 1 : (type == 12) ? 8 : (type == 3) ? 2 : 0; /* ASCII, DOUBLE, SHORT (GeoKeyDirectory) */
         if (type_size == 0) continue;
         uint64_t total_bytes = (uint64_t)type_size * count;
 
@@ -134,6 +151,30 @@ static int ReadGeoTagsRaw(const char *path, double *outScale, int *outScaleCount
             for (int i = 0; i < n; i++) out[i] = RawReadDouble(&rt);
             if (tag == DTM_TAG_GEOPIXELSCALE) *outScaleCount = n;
             else *outTiepointCount = n;
+        } else if (tag == DTM_TAG_GEOKEYDIRECTORY) {
+            /* Array of SHORTs: a 4-value header (version, keyRevision,
+             * minorRevision, numberOfKeys) then numberOfKeys groups of 4
+             * (KeyID, TIFFTagLocation, Count, Value/Offset). Only the two
+             * keys that matter here (1024, 3072) are ever inline SHORT
+             * values (TIFFTagLocation 0) in practice, so that's all this
+             * reads -- not a general GeoKey parser. */
+            fseek(fp, (long)data_offset, SEEK_SET);
+            uint16_t numKeys = 0;
+            if (count >= 4) {
+                RawReadUint(&rt, 2); /* KeyDirectoryVersion, always 1 */
+                RawReadUint(&rt, 2); /* KeyRevision */
+                RawReadUint(&rt, 2); /* MinorRevision */
+                numKeys = (uint16_t)RawReadUint(&rt, 2);
+            }
+            for (uint16_t k = 0; k < numKeys && (uint64_t)(4 + (k + 1) * 4) <= count; k++) {
+                uint16_t keyId = (uint16_t)RawReadUint(&rt, 2);
+                uint16_t loc = (uint16_t)RawReadUint(&rt, 2);
+                RawReadUint(&rt, 2); /* keyCount, unused for inline SHORT keys */
+                uint16_t val = (uint16_t)RawReadUint(&rt, 2);
+                if (loc != 0) continue; /* not an inline value -- not needed for 1024/3072 */
+                if (keyId == GEOKEY_GTMODELTYPE) *outIsProjected = (val == 1);
+                else if (keyId == GEOKEY_PROJECTEDCSTYPE) *outEpsg = val;
+            }
         } else { /* DTM_TAG_GDAL_NODATA, ASCII */
             size_t n = (size_t)count;
             if (n >= outNodataSize) n = outNodataSize - 1;
@@ -147,6 +188,88 @@ static int ReadGeoTagsRaw(const char *path, double *outScale, int *outScaleCount
 
     fclose(fp);
     return 0;
+}
+
+/* Decodes a UTM EPSG code into zone/hemisphere. NAD83 zones (26901-26923,
+ * used by USGS's 1-meter DEM -- CONUS never needs zone > 23) and WGS84
+ * zones (32601-32660 north, 32701-32760 south) both map to the same
+ * ellipsoid for this project's purposes (see the datum comment on
+ * EnsureDtmCoverage -- NAD83 vs WGS84 is a ~1-2m discrepancy, already
+ * accepted as negligible elsewhere in this project). Returns 1 and fills
+ * outZone (1-60)/outNorth on a recognized UTM code, 0 otherwise. */
+static int EpsgToUtmZone(int epsg, int *outZone, int *outNorth) {
+    if (epsg >= 26901 && epsg <= 26923) { *outZone = epsg - 26900; *outNorth = 1; return 1; }
+    if (epsg >= 32601 && epsg <= 32660) { *outZone = epsg - 32600; *outNorth = 1; return 1; }
+    if (epsg >= 32701 && epsg <= 32760) { *outZone = epsg - 32700; *outNorth = 0; return 1; }
+    return 0;
+}
+
+/* WGS84/GRS80 ellipsoid -- functionally identical for NAD83 too (both
+ * derive from the same reference ellipsoid to well under 1mm difference,
+ * far tighter than the ~1-2m datum-origin discrepancy already accepted
+ * elsewhere). Standard non-iterative Snyder transverse Mercator forward/
+ * inverse formulas (used by PROJ/GDAL and every other UTM implementation
+ * this project's numbers were cross-checked against), accurate to
+ * sub-meter within a single UTM zone -- far tighter than this tool needs
+ * at 1m pixel resolution. */
+#define UTM_A  6378137.0
+#define UTM_F  (1.0 / 298.257223563)
+#define UTM_K0 0.9996
+#define UTM_E0 500000.0
+
+static void LatLonToUtm(double lat, double lon, int zone, int north, double *outE, double *outN) {
+    double e2 = UTM_F * (2.0 - UTM_F);
+    double ep2 = e2 / (1.0 - e2);
+    double phi = lat * M_PI / 180.0;
+    double lambda = lon * M_PI / 180.0;
+    double lambda0 = ((zone - 1) * 6 - 180 + 3) * M_PI / 180.0;
+
+    double sinPhi = sin(phi), cosPhi = cos(phi), tanPhi = tan(phi);
+    double Nrad = UTM_A / sqrt(1.0 - e2 * sinPhi * sinPhi);
+    double T = tanPhi * tanPhi;
+    double C = ep2 * cosPhi * cosPhi;
+    double A = cosPhi * (lambda - lambda0);
+    double M = UTM_A * ((1 - e2/4 - 3*e2*e2/64 - 5*e2*e2*e2/256) * phi
+                         - (3*e2/8 + 3*e2*e2/32 + 45*e2*e2*e2/1024) * sin(2*phi)
+                         + (15*e2*e2/256 + 45*e2*e2*e2/1024) * sin(4*phi)
+                         - (35*e2*e2*e2/3072) * sin(6*phi));
+
+    *outE = UTM_E0 + UTM_K0 * Nrad * (A + (1-T+C)*A*A*A/6.0 + (5-18*T+T*T+72*C-58*ep2)*A*A*A*A*A/120.0);
+    *outN = UTM_K0 * (M + Nrad*tanPhi*(A*A/2.0 + (5-T+9*C+4*C*C)*A*A*A*A/24.0 + (61-58*T+T*T+600*C-330*ep2)*A*A*A*A*A*A/720.0));
+    if (!north) *outN += 10000000.0;
+}
+
+static void UtmToLatLon(double e, double n, int zone, int north, double *outLat, double *outLon) {
+    double e2 = UTM_F * (2.0 - UTM_F);
+    double ep2 = e2 / (1.0 - e2);
+    double e1 = (1.0 - sqrt(1.0 - e2)) / (1.0 + sqrt(1.0 - e2));
+    double lambda0 = ((zone - 1) * 6 - 180 + 3) * M_PI / 180.0;
+
+    double x = e - UTM_E0;
+    double y = north ? n : n - 10000000.0;
+    double M = y / UTM_K0;
+    double mu = M / (UTM_A * (1 - e2/4 - 3*e2*e2/64 - 5*e2*e2*e2/256));
+
+    double phi1 = mu + (3*e1/2 - 27*e1*e1*e1/32)*sin(2*mu)
+                      + (21*e1*e1/16 - 55*e1*e1*e1*e1/32)*sin(4*mu)
+                      + (151*e1*e1*e1/96)*sin(6*mu)
+                      + (1097*e1*e1*e1*e1/512)*sin(8*mu);
+
+    double sinPhi1 = sin(phi1), cosPhi1 = cos(phi1), tanPhi1 = tan(phi1);
+    double C1 = ep2 * cosPhi1 * cosPhi1;
+    double T1 = tanPhi1 * tanPhi1;
+    double N1 = UTM_A / sqrt(1.0 - e2 * sinPhi1 * sinPhi1);
+    double R1 = UTM_A * (1.0 - e2) / pow(1.0 - e2 * sinPhi1 * sinPhi1, 1.5);
+    double D = x / (N1 * UTM_K0);
+
+    double phi = phi1 - (N1 * tanPhi1 / R1) * (D*D/2.0
+                 - (5+3*T1+10*C1-4*C1*C1-9*ep2)*D*D*D*D/24.0
+                 + (61+90*T1+298*C1+45*T1*T1-252*ep2-3*C1*C1)*D*D*D*D*D*D/720.0);
+    double lambda = lambda0 + (D - (1+2*T1+C1)*D*D*D/6.0
+                    + (5-2*C1+28*T1-3*C1*C1+8*ep2+24*T1*T1)*D*D*D*D*D/120.0) / cosPhi1;
+
+    *outLat = phi * 180.0 / M_PI;
+    *outLon = lambda * 180.0 / M_PI;
 }
 
 #define DTM_MAX_LEVELS 16
@@ -170,7 +293,16 @@ struct DtmFile {
     char *path;
     int current_dir;
     int num_levels;
-    double lonMin, lonMax, latMin, latMax; /* level-independent: every overview covers the same geographic extent */
+    /* Native coordinate bounds -- level-independent, every overview covers
+     * the same extent. Degrees (lon/lat) for a geographic file, meters
+     * (easting/northing) for a projected UTM file -- see isUtm below and
+     * FileNativeXY, which converts an incoming query point into whichever
+     * system this particular file actually uses before anything touches
+     * these bounds. */
+    double xMin, xMax, yMin, yMax;
+    int isUtm;        /* 0 = geographic lat/lon (Wyoming, USGS 1/3as), 1 = projected UTM (USGS 1m) */
+    int utmZone;       /* 1-60, meaningless unless isUtm */
+    int utmNorth;      /* 1 = northern hemisphere, meaningless unless isUtm */
     double nodata;
     int sample_is_float;  /* 0 = uint16 (Wyoming wyolidar), 1 = float32 (USGS 3DEP) -- see DtmSetAddFile */
     int bytes_per_sample; /* 2 or 4, matching sample_is_float */
@@ -223,14 +355,19 @@ int DtmSetAddFile(DtmSet *set, const char *path) {
     }
 
     double scale[6], tiepoint[6];
-    int scaleCount = 0, tiepointCount = 0, hasNodata = 0;
+    int scaleCount = 0, tiepointCount = 0, hasNodata = 0, isProjected = 0, epsg = 0;
     char nodataStr[64];
-    if (ReadGeoTagsRaw(path, scale, &scaleCount, tiepoint, &tiepointCount, nodataStr, sizeof(nodataStr), &hasNodata) != 0) {
+    if (ReadGeoTagsRaw(path, scale, &scaleCount, tiepoint, &tiepointCount, nodataStr, sizeof(nodataStr), &hasNodata, &isProjected, &epsg) != 0) {
         fprintf(stderr, "dtm: couldn't open %s to read its GeoTIFF tags\n", path);
         return -1;
     }
     if (scaleCount < 2 || tiepointCount < 6) {
         fprintf(stderr, "dtm: %s: missing ModelPixelScale/ModelTiepoint GeoTIFF tags -- not a recognized DTM layout\n", path);
+        return -1;
+    }
+    int utmZone = 0, utmNorth = 0;
+    if (isProjected && !EpsgToUtmZone(epsg, &utmZone, &utmNorth)) {
+        fprintf(stderr, "dtm: %s: projected CRS EPSG:%d isn't a recognized UTM zone -- not a recognized DTM layout\n", path, epsg);
         return -1;
     }
 
@@ -276,23 +413,29 @@ int DtmSetAddFile(DtmSet *set, const char *path) {
 
     /* Tiepoint is (I,J,K, X,Y,Z) for one raster corner -- these files always
      * tie (0,0) to the northwest corner, but compute from whatever I,J is
-     * given rather than assuming, in case that ever changes. */
+     * given rather than assuming, in case that ever changes. X/Y here are
+     * in whatever coordinate system the file itself uses (degrees for a
+     * geographic file, UTM meters for a projected one) -- the math is
+     * identical either way, only the units differ. */
     double i0 = tiepoint[0], j0 = tiepoint[1], x0 = tiepoint[3], y0 = tiepoint[4];
     double sx = scale[0], sy = scale[1];
-    double lonNW = x0 - i0 * sx;
-    double latNW = y0 + j0 * sy;
-    double lonSE = lonNW + width * sx;
-    double latSE = latNW - height * sy;
+    double xNW = x0 - i0 * sx;
+    double yNW = y0 + j0 * sy;
+    double xSE = xNW + width * sx;
+    double ySE = yNW - height * sy;
 
     DtmFile *f = calloc(1, sizeof(DtmFile));
     if (!f) { fprintf(stderr, "dtm: out of memory\n"); TIFFClose(tiff); return -1; }
     f->tiff = tiff;
     f->path = strdup(path);
     f->current_dir = 0;
-    f->lonMin = lonNW < lonSE ? lonNW : lonSE;
-    f->lonMax = lonNW < lonSE ? lonSE : lonNW;
-    f->latMin = latSE < latNW ? latSE : latNW;
-    f->latMax = latSE < latNW ? latNW : latSE;
+    f->xMin = xNW < xSE ? xNW : xSE;
+    f->xMax = xNW < xSE ? xSE : xNW;
+    f->yMin = ySE < yNW ? ySE : yNW;
+    f->yMax = ySE < yNW ? yNW : ySE;
+    f->isUtm = isProjected;
+    f->utmZone = utmZone;
+    f->utmNorth = utmNorth;
     f->sample_is_float = isFloat32;
     f->bytes_per_sample = isFloat32 ? 4 : 2;
 
@@ -314,9 +457,19 @@ int DtmSetAddFile(DtmSet *set, const char *path) {
     }
 
     set->files[set->file_count++] = f;
-    printf("dtm: opened %s: %dx%d px, %d pyramid level%s, lon [%.4f, %.4f] lat [%.4f, %.4f], nodata=%.0f\n",
-           path, (int)f->level_info[0].width, (int)f->level_info[0].height, f->num_levels,
-           f->num_levels == 1 ? "" : "s", f->lonMin, f->lonMax, f->latMin, f->latMax, f->nodata);
+    if (f->isUtm) {
+        double lat1, lon1, lat2, lon2;
+        UtmToLatLon(f->xMin, f->yMin, f->utmZone, f->utmNorth, &lat1, &lon1);
+        UtmToLatLon(f->xMax, f->yMax, f->utmZone, f->utmNorth, &lat2, &lon2);
+        printf("dtm: opened %s: %dx%d px, %d pyramid level%s, UTM zone %d%c E[%.0f, %.0f] N[%.0f, %.0f] (~lon [%.4f, %.4f] lat [%.4f, %.4f]), nodata=%.0f\n",
+               path, (int)f->level_info[0].width, (int)f->level_info[0].height, f->num_levels,
+               f->num_levels == 1 ? "" : "s", f->utmZone, f->utmNorth ? 'N' : 'S',
+               f->xMin, f->xMax, f->yMin, f->yMax, lon1, lon2, lat1, lat2, f->nodata);
+    } else {
+        printf("dtm: opened %s: %dx%d px, %d pyramid level%s, lon [%.4f, %.4f] lat [%.4f, %.4f], nodata=%.0f\n",
+               path, (int)f->level_info[0].width, (int)f->level_info[0].height, f->num_levels,
+               f->num_levels == 1 ? "" : "s", f->xMin, f->xMax, f->yMin, f->yMax, f->nodata);
+    }
     return 0;
 }
 
@@ -404,8 +557,24 @@ static double SamplePixel(DtmFile *f, int level, uint32_t col, uint32_t row) {
     return (double)raw;
 }
 
+/* Converts a query point into whichever coordinate system `f`'s bounds
+ * are actually expressed in -- identity for a geographic file, a forward
+ * UTM projection for a projected one. Doing the conversion here (once per
+ * query point) rather than converting the file's own bounds to lat/lon
+ * once at load time is what keeps FileCovers/SampleFile's bounds check
+ * and pixel math *exact*: a UTM tile's true shape is an axis-aligned box
+ * in UTM meters, not in lat/lon (the grid doesn't follow meridians), so
+ * checking containment against a lat/lon-approximated box would be the
+ * one introducing error, not this. */
+static void FileNativeXY(const DtmFile *f, double lat, double lon, double *outX, double *outY) {
+    if (f->isUtm) LatLonToUtm(lat, lon, f->utmZone, f->utmNorth, outX, outY);
+    else { *outX = lon; *outY = lat; }
+}
+
 static int FileCovers(const DtmFile *f, double lat, double lon) {
-    return lat >= f->latMin && lat <= f->latMax && lon >= f->lonMin && lon <= f->lonMax;
+    double x, y;
+    FileNativeXY(f, lat, lon, &x, &y);
+    return y >= f->yMin && y <= f->yMax && x >= f->xMin && x <= f->xMax;
 }
 
 static double SampleFile(DtmFile *f, double lat, double lon, int level) {
@@ -414,8 +583,10 @@ static double SampleFile(DtmFile *f, double lat, double lon, int level) {
     if (!EnsureLevelInfo(f, level)) return DTM_NODATA;
     LevelInfo *li = &f->level_info[level];
 
-    double colf = (lon - f->lonMin) / (f->lonMax - f->lonMin) * li->width;
-    double rowf = (f->latMax - lat) / (f->latMax - f->latMin) * li->height;
+    double x, y;
+    FileNativeXY(f, lat, lon, &x, &y);
+    double colf = (x - f->xMin) / (f->xMax - f->xMin) * li->width;
+    double rowf = (f->yMax - y) / (f->yMax - f->yMin) * li->height;
 
     /* Pixel-center convention: pixel index p's center is at colf = p + 0.5. */
     double pc = colf - 0.5;
@@ -524,9 +695,17 @@ int main(int argc, char **argv) {
         double mn = 1e18, mx = -1e18;
         int level = f->num_levels > 4 ? 4 : f->num_levels - 1;
         for (int yi = 0; yi <= 40; yi++) {
-            double lat = f->latMin + (f->latMax - f->latMin) * yi / 40.0;
+            double y = f->yMin + (f->yMax - f->yMin) * yi / 40.0;
             for (int xi = 0; xi <= 40; xi++) {
-                double lon = f->lonMin + (f->lonMax - f->lonMin) * xi / 40.0;
+                double x = f->xMin + (f->xMax - f->xMin) * xi / 40.0;
+                /* Interpolate in the file's own native units (degrees or
+                 * UTM meters), then convert to lat/lon -- SampleFile always
+                 * takes lat/lon and re-projects forward itself, so a UTM
+                 * file needs this round trip rather than treating x/y as
+                 * lat/lon directly. */
+                double lat, lon;
+                if (f->isUtm) UtmToLatLon(x, y, f->utmZone, f->utmNorth, &lat, &lon);
+                else { lat = y; lon = x; }
                 double m = SampleFile(f, lat, lon, level);
                 if (m == DTM_NODATA) continue;
                 if (m < mn) mn = m;

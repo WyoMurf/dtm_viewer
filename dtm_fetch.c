@@ -5,6 +5,7 @@
 #include <string.h>
 #include <math.h>
 #include <sys/stat.h>
+#include <unistd.h> /* sleep() -- see FetchJsonUrl's retry */
 
 #include "dtm_fetch.h"
 
@@ -43,6 +44,151 @@ static void UsgsLocalName(const char *tile, char *out, size_t outsz) {
     snprintf(out, outsz, "USGS_13_%s.tif", tile);
 }
 
+/* --- USGS 3DEP 1-meter DEM: unlike the other two sources, this one has
+ * no filename formula -- tiles are organized by named lidar acquisition
+ * "Projects" on a UTM grid (e.g. USGS_1M_12_x66y490_WY_North_Converse_
+ * 2020_D20.tif), not a clean lat/lon scheme, and coverage is patchy
+ * project-by-project rather than nationally uniform. Finding the right
+ * tile for a point needs a real lookup: USGS's TNM Access product-search
+ * API (the same one their own download tools use -- confirmed directly,
+ * not assumed, against real points: Jackson Hole, WY and Meeteotse, WY
+ * both returned real S3 download URLs; a mid-Pacific point correctly
+ * returned zero results). Tried between Wyoming (which still wins on
+ * resolution where it has coverage) and the 1/3 arc-second fallback
+ * (nationally complete but 10x coarser) -- this source fills the gap for
+ * the "outside Wyoming, but still recent enough to have 1m lidar" case,
+ * which by now is most of the country. */
+#define TNM_API_URL "https://tnmaccess.nationalmap.gov/api/v1/products"
+
+static const char *JsonBoundedFind(const char *start, const char *end, const char *needle) {
+    size_t nlen = strlen(needle);
+    if (nlen == 0 || end < start) return NULL;
+    for (const char *p = start; p + nlen <= end; p++) {
+        if (memcmp(p, needle, nlen) == 0) return p;
+    }
+    return NULL;
+}
+
+/* Finds "key": <value> and returns a pointer just past the colon and any
+ * whitespace, or NULL if the key isn't in [start,end). */
+static const char *JsonFindValue(const char *start, const char *end, const char *key) {
+    char pat[48];
+    snprintf(pat, sizeof(pat), "\"%s\":", key);
+    const char *p = JsonBoundedFind(start, end, pat);
+    if (!p) return NULL;
+    p += strlen(pat);
+    while (p < end && (*p == ' ' || *p == '\t')) p++;
+    return p;
+}
+static int JsonGetString(const char *start, const char *end, const char *key, char *out, size_t outsz) {
+    const char *p = JsonFindValue(start, end, key);
+    if (!p || p >= end || *p != '"') return 0;
+    p++;
+    size_t i = 0;
+    while (p < end && *p != '"' && i + 1 < outsz) out[i++] = *p++;
+    out[i] = 0;
+    return 1;
+}
+static int JsonGetDouble(const char *start, const char *end, const char *key, double *out) {
+    const char *p = JsonFindValue(start, end, key);
+    if (!p) return 0;
+    *out = atof(p);
+    return 1;
+}
+static int JsonGetLong(const char *start, const char *end, const char *key, long *out) {
+    const char *p = JsonFindValue(start, end, key);
+    if (!p) return 0;
+    *out = atol(p);
+    return 1;
+}
+
+static char *FetchJsonUrl(const char *url) {
+    char cmd[900];
+    snprintf(cmd, sizeof(cmd), "curl -sf --max-time 20 '%s'", url);
+    for (int attempt = 1; attempt <= 2; attempt++) {
+        FILE *p = popen(cmd, "r");
+        if (!p) return NULL;
+        size_t cap = 1 << 16, len = 0;
+        char *buf = malloc(cap);
+        size_t n;
+        while ((n = fread(buf + len, 1, cap - len, p)) > 0) {
+            len += n;
+            if (len == cap) { cap *= 2; buf = realloc(buf, cap); }
+        }
+        int rc = pclose(p);
+        if (rc == 0 && len > 0) { buf[len < cap ? len : cap - 1] = 0; return buf; }
+        free(buf);
+        if (attempt == 1) sleep(1);
+    }
+    return NULL;
+}
+
+/* Queries TNM for the 1m tile covering (lat,lon); on success fills
+ * outUrl/outLocalName/outSize and returns 0. -1 if the API has no tile
+ * there or the query itself failed. Picks the first result whose own
+ * bounding box actually contains the point (a query near a tile edge can
+ * return more than one candidate); falls back to the first result if
+ * none strictly contain it. */
+static int Usgs1mLookup(double lat, double lon, char *outUrl, size_t outUrlSz, char *outLocalName, size_t outLocalSz, long *outSize) {
+    char url[500];
+    snprintf(url, sizeof(url), TNM_API_URL "?bbox=%.6f,%.6f,%.6f,%.6f&datasets=Digital%%20Elevation%%20Model%%20(DEM)%%201%%20meter&outputFormat=JSON", lon, lat, lon, lat);
+
+    char *json = FetchJsonUrl(url);
+    if (!json) return -1;
+
+    const char *end = json + strlen(json);
+    const char *bestUrl = NULL, *bestItemStart = NULL;
+    long bestSize = -1;
+
+    const char *p = json;
+    while ((p = JsonBoundedFind(p, end, "\"title\":")) != NULL) {
+        const char *itemStart = p;
+        const char *itemEnd = JsonBoundedFind(p + 1, end, "\"title\":");
+        if (!itemEnd) itemEnd = end;
+
+        double minX, maxX, minY, maxY;
+        int haveBbox = JsonGetDouble(itemStart, itemEnd, "minX", &minX) && JsonGetDouble(itemStart, itemEnd, "maxX", &maxX) &&
+                        JsonGetDouble(itemStart, itemEnd, "minY", &minY) && JsonGetDouble(itemStart, itemEnd, "maxY", &maxY);
+
+        if (!bestItemStart) bestItemStart = itemStart; /* first result overall, as a fallback */
+        if (haveBbox && lon >= minX && lon <= maxX && lat >= minY && lat <= maxY) {
+            bestItemStart = itemStart;
+            long size = -1;
+            JsonGetLong(itemStart, itemEnd, "sizeInBytes", &size);
+            static char urlBuf[700];
+            if (JsonGetString(itemStart, itemEnd, "downloadURL", urlBuf, sizeof(urlBuf))) {
+                bestUrl = urlBuf;
+                bestSize = size;
+                break; /* exact containment found -- good enough, stop looking */
+            }
+        }
+        p = itemEnd;
+    }
+
+    /* No item's bbox strictly contained the point (can happen right at a
+     * tile seam) -- just use the first result the API gave us. */
+    if (!bestUrl && bestItemStart) {
+        const char *itemEnd = JsonBoundedFind(bestItemStart + 1, end, "\"title\":");
+        if (!itemEnd) itemEnd = end;
+        long size = -1;
+        JsonGetLong(bestItemStart, itemEnd, "sizeInBytes", &size);
+        static char urlBuf2[700];
+        if (JsonGetString(bestItemStart, itemEnd, "downloadURL", urlBuf2, sizeof(urlBuf2))) {
+            bestUrl = urlBuf2;
+            bestSize = size;
+        }
+    }
+
+    free(json);
+    if (!bestUrl) return -1;
+
+    snprintf(outUrl, outUrlSz, "%s", bestUrl);
+    const char *slash = strrchr(bestUrl, '/');
+    snprintf(outLocalName, outLocalSz, "%s", slash ? slash + 1 : bestUrl);
+    *outSize = bestSize;
+    return 0;
+}
+
 typedef struct {
     const char *label;
     void (*tileName)(double lat, double lon, char *out, size_t outsz);
@@ -52,6 +198,7 @@ typedef struct {
 
 static const DtmSource kWySource = { "Wyoming wyolidar (~1m)", WyTileName, WyRemoteUrl, WyLocalName };
 static const DtmSource kUsgsSource = { "USGS 3DEP (~10m)", UsgsTileName, UsgsRemoteUrl, UsgsLocalName };
+static const char *kUsgs1mLabel = "USGS 3DEP 1m";
 
 static int FileExists(const char *path) {
     struct stat st;
@@ -112,11 +259,11 @@ static int DownloadFile(const char *url, const char *localPath) {
 
 /* Prints what's about to be downloaded and, unless autoConfirm, asks y/N
  * on stdin. Returns 1 to proceed, 0 to decline. */
-static int ConfirmDownload(const DtmSource *src, const char *tile, const char *url, long sizeBytes, int autoConfirm) {
+static int ConfirmDownload(const char *label, const char *tile, const char *url, long sizeBytes, int autoConfirm) {
     if (sizeBytes >= 0) {
-        printf("dtm_fetch: %s tile %s found (%.0f MB)\n  %s\n", src->label, tile, sizeBytes / (1024.0 * 1024.0), url);
+        printf("dtm_fetch: %s tile %s found (%.0f MB)\n  %s\n", label, tile, sizeBytes / (1024.0 * 1024.0), url);
     } else {
-        printf("dtm_fetch: %s tile %s found (size unknown)\n  %s\n", src->label, tile, url);
+        printf("dtm_fetch: %s tile %s found (size unknown)\n  %s\n", label, tile, url);
     }
     if (autoConfirm) {
         printf("dtm_fetch: TV_AUTO_DOWNLOAD set, downloading without prompting\n");
@@ -159,7 +306,7 @@ static int TrySource(const DtmSource *src, DtmSet *set, double lat, double lon, 
     long httpCode = HeadRequest(url, &size);
     if (httpCode != 200) return -1; /* no such tile at this source -- not an error, just "try the next one" */
 
-    if (!ConfirmDownload(src, tile, url, size, autoConfirm)) return -2;
+    if (!ConfirmDownload(src->label, tile, url, size, autoConfirm)) return -2;
 
     printf("dtm_fetch: downloading %s -> %s ...\n", url, localPath);
     if (DownloadFile(url, localPath) != 0) {
@@ -182,10 +329,50 @@ static int TrySource(const DtmSource *src, DtmSet *set, double lat, double lon, 
     return -1;
 }
 
+/* Same shape/contract as TrySource, but the tile name+URL come from a
+ * live TNM query (see Usgs1mLookup) instead of a filename formula. */
+static int TryUsgs1mSource(DtmSet *set, double lat, double lon, const char *cacheDir, int autoConfirm) {
+    char url[700], localName[200], localPath[900];
+    long size;
+    if (Usgs1mLookup(lat, lon, url, sizeof(url), localName, sizeof(localName), &size) != 0) return -1;
+
+    snprintf(localPath, sizeof(localPath), "%s/%s", cacheDir, localName);
+
+    if (FileExists(localPath)) {
+        if (DtmSetAddFile(set, localPath) == 0) {
+            printf("dtm_fetch: %s tile %s already cached at %s\n", kUsgs1mLabel, localName, localPath);
+            return 0;
+        }
+        fprintf(stderr, "dtm_fetch: cached file %s failed to open (incomplete download?) -- deleting and re-fetching\n", localPath);
+        remove(localPath);
+    }
+
+    if (!ConfirmDownload(kUsgs1mLabel, localName, url, size, autoConfirm)) return -2;
+
+    printf("dtm_fetch: downloading %s -> %s ...\n", url, localPath);
+    if (DownloadFile(url, localPath) != 0) {
+        fprintf(stderr, "dtm_fetch: download failed for %s\n", url);
+        remove(localPath);
+        return -1;
+    }
+    if (size >= 0 && FileSize(localPath) != size) {
+        fprintf(stderr, "dtm_fetch: downloaded file size mismatch for %s (expected %ld bytes, got %ld) -- discarding\n", localPath, size, FileSize(localPath));
+        remove(localPath);
+        return -1;
+    }
+    printf("dtm_fetch: done.\n");
+    if (DtmSetAddFile(set, localPath) == 0) return 0;
+    remove(localPath);
+    return -1;
+}
+
 int EnsureDtmCoverage(DtmSet *set, double lat, double lon, const char *cacheDir, int autoConfirm) {
     if (DtmSetCovers(set, lat, lon)) return 0;
 
     int rc = TrySource(&kWySource, set, lat, lon, cacheDir, autoConfirm);
+    if (rc == 0 || rc == -2) return rc;
+
+    rc = TryUsgs1mSource(set, lat, lon, cacheDir, autoConfirm);
     if (rc == 0 || rc == -2) return rc;
 
     rc = TrySource(&kUsgsSource, set, lat, lon, cacheDir, autoConfirm);

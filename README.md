@@ -14,8 +14,9 @@ view of the same place.)
 DATA SOURCES:
 
 `terrain_viewer` locates and downloads whatever DTM tile(s) cover wherever
-you point it, anywhere in the US -- no manual data prep needed. Two real,
-public, unauthenticated data sources, tried in order (`dtm_fetch.c`):
+you point it, anywhere in the US -- no manual data prep needed. Three real,
+public, unauthenticated data sources, tried in order, best resolution
+first (`dtm_fetch.c`):
 
 1. **Wyoming wyolidar** (https://lidar.wygisc.org/wyolidar, bucket
    `wyolidar.s3.arcc.uwyo.edu`) -- ~1m lidar, statewide (40 tiles,
@@ -23,21 +24,47 @@ public, unauthenticated data sources, tried in order (`dtm_fetch.c`):
    16-bit unsigned int elevation in whole meters, EPSG:4326 (geographic
    lat/lon), LZW-compressed, 11-level overview pyramid. This project's
    original three manually-downloaded tiles (Cody/Meeteetse/Bighorn) are
-   this same format and are reused as-is, never re-fetched.
-2. **USGS 3DEP** (bucket `prd-tnm.s3.amazonaws.com`) -- nationwide 1/3
-   arc-second (~10m) seamless DEM, tried wherever Wyoming's higher-res data
-   doesn't reach. Classic TIFF, single-band 32-bit float elevation in
-   meters, clean degree-aligned tiles (`n{lat}w{lon}` naming), NODATA
-   -999999. NAD83 vs. Wyoming's WGS84 datum -- a ~1-2m horizontal
-   discrepancy in CONUS, well below this tool's precision.
+   this same format and are reused as-is, never re-fetched. Tile name is a
+   pure formula from lat/lon -- no network round trip needed just to find
+   the right one.
+2. **USGS 3DEP 1-meter DEM** (also `prd-tnm.s3.amazonaws.com`, under
+   `StagedProducts/Elevation/1m/`) -- matches Wyoming's own resolution
+   wherever it's been flown, which by now is most of the country. Unlike
+   the other two sources, tiles here are organized by named lidar-
+   acquisition "Projects" on a UTM grid rather than a clean lat/lon
+   formula, so `dtm_fetch.c` queries USGS's TNM Access product-search API
+   (`tnmaccess.nationalmap.gov/api/v1/products` -- the same API USGS's own
+   download tools use) for the specific tile/URL covering a point, rather
+   than computing a filename. Classic TIFF, single-band 32-bit float
+   elevation in meters, **UTM projected coordinates** (not geographic
+   lat/lon -- confirmed directly by parsing a real tile's GeoKeyDirectory:
+   EPSG:26911, NAD83 / UTM zone 11N), NODATA -999999.
+3. **USGS 3DEP 1/3 arc-second** (also `prd-tnm.s3.amazonaws.com`) --
+   nationwide (~10m) seamless DEM, the final fallback wherever neither of
+   the above has coverage. Classic TIFF, single-band 32-bit float
+   elevation in meters, clean degree-aligned tiles (`n{lat}w{lon}`
+   naming), NODATA -999999. NAD83 vs. Wyoming's WGS84 datum -- a ~1-2m
+   horizontal discrepancy in CONUS, well below this tool's precision (also
+   true of the 1-meter source's NAD83 UTM tiles).
 
-`dtm.c` reads both layouts directly (uint16 or float32 samples, detected
-per-file from the TIFF tags) -- no ingestion tool needed for either.
+`dtm.c` reads all three layouts directly (uint16 or float32 samples,
+geographic or UTM-projected coordinates, all detected per-file from the
+TIFF's own GeoTIFF tags) -- no ingestion tool needed for any of them. UTM
+support means parsing the file's GeoKeyDirectoryTag (34735) for
+GTModelTypeGeoKey/ProjectedCSTypeGeoKey to detect a projected CRS and
+decode its EPSG code into a UTM zone/hemisphere, then a standard
+non-iterative Snyder transverse Mercator transform (forward for sampling
+a query point against the file's native UTM bounds, inverse only for
+the friendly lon/lat range printed when a file opens) -- verified
+end-to-end against a real downloaded 1-meter tile: sampling returned real
+terrain (2007.4m in the Nevada high desert) instead of silently reporting
+NODATA for a point the tile genuinely covers.
 
 At startup, `terrain_viewer` scans two directories for `*.tif` and loads
 whatever's already there: `/home/murf/wyodem/lidar` (the original
 hand-downloaded Wyoming tiles) and `~/dtm_cache` (where auto-downloaded
-tiles, from either source, land and get reused on future runs). To add
+tiles, from any of the three sources, land and get reused on future
+runs). To add
 your own pre-downloaded tiles, just drop them in either directory --
 edit `kDtmSearchDirs` in `terrain_viewer.c` to add more.
 
