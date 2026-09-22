@@ -16,6 +16,7 @@
 #include "dtm_fetch.h"
 #include "osm_roads.h"
 #include "geo_utils.h"
+#include "longley_rice.h"
 
 static void EnsureCoverageOrWarn(double lat, double lon);
 
@@ -820,6 +821,21 @@ typedef struct {
     double freqMHz;
     double eirpDbm;
     double sensDbm; /* receiver sensitivity threshold -- below this, marked as no usable coverage regardless of the continuous color ramp */
+
+    /* --itm: swap the single-knife-edge model above for a real port of the
+     * NTIA/ITS Irregular Terrain Model (Longley-Rice), point-to-point mode
+     * -- see longley_rice.c/.h. Needs a handful of regional constants the
+     * simple model doesn't: ground electrical properties and atmosphere/
+     * climate, all defaulted to standard "average" values (see main()'s
+     * argument parsing) rather than requiring the user to look anything
+     * up, matching how real ITM-based studies work unless someone has a
+     * specific reason to override them. */
+    int useItm;
+    int climate;   /* CLIMATE__* from longley_rice.h */
+    int pol;       /* POLARIZATION__* from longley_rice.h */
+    double epsilon; /* relative permittivity (dielectric constant) of the ground */
+    double sigma;   /* ground conductivity, S/m */
+    double N0;      /* surface refractivity, N-units */
 } RfParams;
 
 #define SPEED_OF_LIGHT_M_S 299792458.0
@@ -911,57 +927,128 @@ static double ComputeViewshedRaster(Color *pixels, double towerLat, double tower
         for (int i = 0; i < VIEWSHED_MAP_PX * VIEWSHED_MAP_PX; i++) margin[i] = NAN;
     }
 
-    for (int b = 0; b < bearingCount; b++) {
-        double bearing = 360.0 * b / bearingCount;
-        double bearingRad = bearing * DEG2RAD;
-        double sinB = sin(bearingRad), cosB = cos(bearingRad);
-        double maxAngle = -1e18;
-        double obstDistKm = -1.0, obstElevM = 0.0; /* the single controlling (worst-so-far) obstruction along this ray, for the RF model's diffraction term -- see the RfParams comment */
+    if (rf->enabled && rf->useItm) {
+        /* ITM needs the actual digitized terrain profile from tower to
+         * target (pfl[]), not just a running horizon angle, and each
+         * evaluation costs O(profile length) instead of the knife-edge
+         * model's O(1) -- calling it at the same fine stepKm resolution
+         * the geometry sweep uses (often thousands of steps per bearing)
+         * would be far too slow. So this uses a much coarser radial
+         * spacing of its own (itmStepKm, capped at ~150 points per ray),
+         * building pfl[] incrementally as it walks outward -- exactly the
+         * evenly-spaced/elevations-only format the ported reference
+         * implementation expects -- and splats each result over a bigger
+         * box than the geometry loop's 3x3 to cover the wider radial
+         * gaps this coarser spacing leaves. Full angular resolution
+         * (bearingCount, same as the geometry sweep) is kept so there are
+         * no angular gaps/streaks. */
+        double towerGroundM = DtmSampleMeters(&g_dtm, towerLat, towerLon, 0);
+        double hTxM = towerElevM - towerGroundM;
+        double itmStepKm = maxDistanceKm / 150.0;
+        if (itmStepKm < stepKm) itmStepKm = stepKm;
+        int maxPts = (int)(maxDistanceKm / itmStepKm) + 4;
+        double *pfl = malloc(sizeof(double) * (size_t)(maxPts + 2));
+        int splatR = (int)ceil((itmStepKm * 1000.0 / metersPerPixel) / 2.0);
+        if (splatR < 1) splatR = 1;
+        if (splatR > 6) splatR = 6;
 
-        for (double d = stepKm; d <= maxDistanceKm; d += stepKm) {
-            double lat, lon;
-            destination_point(towerLat, towerLon, bearing, d, EARTH_RADIUS_KM, &lat, &lon);
-            double dM = d * 1000.0;
-            int level = d < 2.0 ? 0 : d < 8.0 ? 2 : 4;
-            double ground = DtmSampleMeters(&g_dtm, lat, lon, level);
-            if (ground == DTM_NODATA) break; /* no more loaded data this direction */
+        for (int b = 0; b < bearingCount; b++) {
+            double bearing = 360.0 * b / bearingCount;
+            double bearingRad = bearing * DEG2RAD;
+            double sinB = sin(bearingRad), cosB = cos(bearingRad);
+            pfl[2] = towerGroundM; /* profile point 0: the tower's own bare-ground elevation */
+            int np = 0;
 
-            double groundAngle = (ground - towerElevM) / dM - dM / (2.0 * effectiveRadiusM);
-            double rxElevM = ground + VIEWSHED_RECEIVER_HEIGHT_M;
-            double receiverAngle = (rxElevM - towerElevM) / dM - dM / (2.0 * effectiveRadiusM);
-            int visible = receiverAngle > maxAngle;
+            for (double d = itmStepKm; d <= maxDistanceKm; d += itmStepKm) {
+                double lat, lon;
+                destination_point(towerLat, towerLon, bearing, d, EARTH_RADIUS_KM, &lat, &lon);
+                int level = d < 2.0 ? 0 : d < 8.0 ? 2 : 4;
+                double ground = DtmSampleMeters(&g_dtm, lat, lon, level);
+                if (ground == DTM_NODATA) break; /* no more loaded data this direction */
+                np++;
+                pfl[2 + np] = ground;
+                pfl[0] = (double)np;
+                pfl[1] = itmStepKm * 1000.0;
 
-            Color c = blockedColor;
-            double thisMargin = 0.0;
-            if (rf->enabled) {
-                double diffLossDb = 0.0;
-                if (obstDistKm > 0.0) {
-                    double d1 = obstDistKm, d2 = d - obstDistKm;
-                    double bulgeAtObstM = 1000.0 * (d1 * d2) / (2.0 * effectiveRadiusKm);
-                    double lineElevAtObstM = towerElevM + (rxElevM - towerElevM) * (d1 / d) + bulgeAtObstM;
-                    diffLossDb = KnifeEdgeDiffractionLossDb(obstElevM - lineElevAtObstM, d1, d2, rf->freqMHz);
-                }
-                double prDbm = rf->eirpDbm - FreeSpacePathLossDb(d, rf->freqMHz) - diffLossDb;
-                thisMargin = prDbm - rf->sensDbm;
+                double A_db;
+                long warnings;
+                int rtn = ITM_P2P_TLS(hTxM, VIEWSHED_RECEIVER_HEIGHT_M, pfl, rf->climate, rf->N0, rf->freqMHz,
+                                       rf->pol, rf->epsilon, rf->sigma, MDVAR__BROADCAST_MODE, 50.0, 50.0, 50.0,
+                                       &A_db, &warnings);
+                if (rtn >= 1000) continue; /* invalid input at this profile length (e.g. path still too short) -- skip, try farther out */
+
+                double thisMargin = rf->eirpDbm - A_db - rf->sensDbm;
                 if (thisMargin > maxMarginSeen) maxMarginSeen = thisMargin;
-            } else {
-                c = visible ? visibleColor : blockedColor;
+
+                double dM = d * 1000.0;
+                double eastM = dM * sinB, northM = dM * cosB;
+                int px = VIEWSHED_MAP_PX / 2 + (int)lround(eastM / metersPerPixel);
+                int py = VIEWSHED_MAP_PX / 2 - (int)lround(northM / metersPerPixel);
+                for (int oy = -splatR; oy <= splatR; oy++) {
+                    int yy = py + oy;
+                    if (yy < 0 || yy >= VIEWSHED_MAP_PX) continue;
+                    for (int ox = -splatR; ox <= splatR; ox++) {
+                        int xx = px + ox;
+                        if (xx < 0 || xx >= VIEWSHED_MAP_PX) continue;
+                        margin[yy * VIEWSHED_MAP_PX + xx] = (float)thisMargin;
+                    }
+                }
             }
+        }
+        free(pfl);
+    } else {
+        for (int b = 0; b < bearingCount; b++) {
+            double bearing = 360.0 * b / bearingCount;
+            double bearingRad = bearing * DEG2RAD;
+            double sinB = sin(bearingRad), cosB = cos(bearingRad);
+            double maxAngle = -1e18;
+            double obstDistKm = -1.0, obstElevM = 0.0; /* the single controlling (worst-so-far) obstruction along this ray, for the RF model's diffraction term -- see the RfParams comment */
 
-            if (groundAngle > maxAngle) { maxAngle = groundAngle; obstDistKm = d; obstElevM = ground; }
+            for (double d = stepKm; d <= maxDistanceKm; d += stepKm) {
+                double lat, lon;
+                destination_point(towerLat, towerLon, bearing, d, EARTH_RADIUS_KM, &lat, &lon);
+                double dM = d * 1000.0;
+                int level = d < 2.0 ? 0 : d < 8.0 ? 2 : 4;
+                double ground = DtmSampleMeters(&g_dtm, lat, lon, level);
+                if (ground == DTM_NODATA) break; /* no more loaded data this direction */
 
-            double eastM = dM * sinB, northM = dM * cosB; /* bearing convention matches WalkForward/destination_point: 0=north, clockwise */
-            int px = VIEWSHED_MAP_PX / 2 + (int)lround(eastM / metersPerPixel);
-            int py = VIEWSHED_MAP_PX / 2 - (int)lround(northM / metersPerPixel); /* image Y grows downward; north is up */
+                double groundAngle = (ground - towerElevM) / dM - dM / (2.0 * effectiveRadiusM);
+                double rxElevM = ground + VIEWSHED_RECEIVER_HEIGHT_M;
+                double receiverAngle = (rxElevM - towerElevM) / dM - dM / (2.0 * effectiveRadiusM);
+                int visible = receiverAngle > maxAngle;
 
-            for (int oy = -1; oy <= 1; oy++) {
-                int yy = py + oy;
-                if (yy < 0 || yy >= VIEWSHED_MAP_PX) continue;
-                for (int ox = -1; ox <= 1; ox++) {
-                    int xx = px + ox;
-                    if (xx < 0 || xx >= VIEWSHED_MAP_PX) continue;
-                    if (rf->enabled) margin[yy * VIEWSHED_MAP_PX + xx] = (float)thisMargin;
-                    else pixels[yy * VIEWSHED_MAP_PX + xx] = c;
+                Color c = blockedColor;
+                double thisMargin = 0.0;
+                if (rf->enabled) {
+                    double diffLossDb = 0.0;
+                    if (obstDistKm > 0.0) {
+                        double d1 = obstDistKm, d2 = d - obstDistKm;
+                        double bulgeAtObstM = 1000.0 * (d1 * d2) / (2.0 * effectiveRadiusKm);
+                        double lineElevAtObstM = towerElevM + (rxElevM - towerElevM) * (d1 / d) + bulgeAtObstM;
+                        diffLossDb = KnifeEdgeDiffractionLossDb(obstElevM - lineElevAtObstM, d1, d2, rf->freqMHz);
+                    }
+                    double prDbm = rf->eirpDbm - FreeSpacePathLossDb(d, rf->freqMHz) - diffLossDb;
+                    thisMargin = prDbm - rf->sensDbm;
+                    if (thisMargin > maxMarginSeen) maxMarginSeen = thisMargin;
+                } else {
+                    c = visible ? visibleColor : blockedColor;
+                }
+
+                if (groundAngle > maxAngle) { maxAngle = groundAngle; obstDistKm = d; obstElevM = ground; }
+
+                double eastM = dM * sinB, northM = dM * cosB; /* bearing convention matches WalkForward/destination_point: 0=north, clockwise */
+                int px = VIEWSHED_MAP_PX / 2 + (int)lround(eastM / metersPerPixel);
+                int py = VIEWSHED_MAP_PX / 2 - (int)lround(northM / metersPerPixel); /* image Y grows downward; north is up */
+
+                for (int oy = -1; oy <= 1; oy++) {
+                    int yy = py + oy;
+                    if (yy < 0 || yy >= VIEWSHED_MAP_PX) continue;
+                    for (int ox = -1; ox <= 1; ox++) {
+                        int xx = px + ox;
+                        if (xx < 0 || xx >= VIEWSHED_MAP_PX) continue;
+                        if (rf->enabled) margin[yy * VIEWSHED_MAP_PX + xx] = (float)thisMargin;
+                        else pixels[yy * VIEWSHED_MAP_PX + xx] = c;
+                    }
                 }
             }
         }
@@ -1037,7 +1124,8 @@ static int RunViewshedMode(double towerLat, double towerLon, double heightFt, do
     printf("Viewshed: tower (%.5f,%.5f) %.0fm ground + %.0fft = %.0fm, range %.1f km, receiver height %.1fm\n",
            towerLat, towerLon, towerGround, heightFt, towerElevM, maxDistanceKm, VIEWSHED_RECEIVER_HEIGHT_M);
     if (rf->enabled) {
-        printf("RF model: %.1f MHz, EIRP %.1f dBm, sensitivity threshold %.1f dBm\n", rf->freqMHz, rf->eirpDbm, rf->sensDbm);
+        printf("RF model: %.1f MHz, EIRP %.1f dBm, sensitivity threshold %.1f dBm%s\n", rf->freqMHz, rf->eirpDbm, rf->sensDbm,
+               rf->useItm ? " (Longley-Rice/ITM point-to-point)" : " (single-knife-edge diffraction)");
     }
 
     Color *pixels = malloc(sizeof(Color) * VIEWSHED_MAP_PX * VIEWSHED_MAP_PX);
@@ -1087,8 +1175,13 @@ static int RunViewshedMode(double towerLat, double towerLon, double heightFt, do
         if (rf->enabled) {
             DrawText(TextFormat("%.1f MHz, EIRP %.1f dBm  --  color = signal margin above %.0f dBm sensitivity threshold (gray = below it, no usable coverage)",
                                  rf->freqMHz, rf->eirpDbm, rf->sensDbm), marginL, 28, 14, DARKGRAY);
-            DrawText(TextFormat("free-space path loss + single-knife-edge diffraction; %.1fm receiver height; NOT a substitute for a real RF survey", VIEWSHED_RECEIVER_HEIGHT_M),
-                      marginL, 46, 13, GRAY);
+            if (rf->useItm) {
+                DrawText(TextFormat("Longley-Rice/ITM point-to-point (climate/pol/ground constants below); %.1fm receiver height; NOT a substitute for a real RF survey", VIEWSHED_RECEIVER_HEIGHT_M),
+                          marginL, 46, 13, GRAY);
+            } else {
+                DrawText(TextFormat("free-space path loss + single-knife-edge diffraction; %.1fm receiver height; NOT a substitute for a real RF survey", VIEWSHED_RECEIVER_HEIGHT_M),
+                          marginL, 46, 13, GRAY);
+            }
 
             int barX = marginL, barY = marginT + VIEWSHED_MAP_PX + 8, barW = 260, barH = 14;
             for (int i = 0; i < barW; i++) {
@@ -1210,7 +1303,21 @@ int main(int argc, char **argv) {
                                     "    --erp watts    transmitter ERP in watts -- ALSO enables the RF signal-\n"
                                     "                   strength model (default: off, pure geometric LOS map)\n"
                                     "    --freq MHz     carrier frequency in MHz (default: 869, cellular Band A)\n"
-                                    "    --sens dBm     receiver sensitivity threshold (default: -100)\n";
+                                    "    --sens dBm     receiver sensitivity threshold (default: -100)\n"
+                                    "    --itm          use the full Longley-Rice/ITM point-to-point model\n"
+                                    "                   instead of the simpler single-knife-edge estimate\n"
+                                    "                   (requires --erp; slower, more physically complete)\n"
+                                    "    --climate NAME one of: equatorial, continental-subtropical,\n"
+                                    "                   maritime-subtropical, desert, continental-temperate\n"
+                                    "                   (default), maritime-temperate-land,\n"
+                                    "                   maritime-temperate-sea -- ITM only\n"
+                                    "    --pol h|v      polarization, horizontal or vertical (default: v) --\n"
+                                    "                   ITM only\n"
+                                    "    --permittivity E  relative permittivity of the ground (default: 15) --\n"
+                                    "                   ITM only\n"
+                                    "    --conductivity S  ground conductivity, S/m (default: 0.005) -- ITM only\n"
+                                    "    --refractivity N  surface refractivity, N-units (default: 301) --\n"
+                                    "                   ITM only\n";
         if (argc < 5) {
             fprintf(stderr, usage, argv[0]);
             return 1;
@@ -1229,7 +1336,7 @@ int main(int argc, char **argv) {
         }
         double maxDistanceKm = atof(argv[argi++]);
 
-        RfParams rf = { 0, 869.0, 0.0, -100.0 };
+        RfParams rf = { 0, 869.0, 0.0, -100.0, 0, CLIMATE__CONTINENTAL_TEMPERATE, POLARIZATION__VERTICAL, 15.0, 0.005, 301.0 };
         const char *screenshot = getenv("TV_SCREENSHOT");
         while (argi < argc) {
             if (strcmp(argv[argi], "--freq") == 0 && argi + 1 < argc) {
@@ -1243,10 +1350,43 @@ int main(int argc, char **argv) {
             } else if (strcmp(argv[argi], "--sens") == 0 && argi + 1 < argc) {
                 rf.sensDbm = atof(argv[argi + 1]);
                 argi += 2;
+            } else if (strcmp(argv[argi], "--itm") == 0) {
+                rf.useItm = 1;
+                argi += 1;
+            } else if (strcmp(argv[argi], "--climate") == 0 && argi + 1 < argc) {
+                const char *name = argv[argi + 1];
+                if (strcmp(name, "equatorial") == 0) rf.climate = CLIMATE__EQUATORIAL;
+                else if (strcmp(name, "continental-subtropical") == 0) rf.climate = CLIMATE__CONTINENTAL_SUBTROPICAL;
+                else if (strcmp(name, "maritime-subtropical") == 0) rf.climate = CLIMATE__MARITIME_SUBTROPICAL;
+                else if (strcmp(name, "desert") == 0) rf.climate = CLIMATE__DESERT;
+                else if (strcmp(name, "continental-temperate") == 0) rf.climate = CLIMATE__CONTINENTAL_TEMPERATE;
+                else if (strcmp(name, "maritime-temperate-land") == 0) rf.climate = CLIMATE__MARITIME_TEMPERATE_OVER_LAND;
+                else if (strcmp(name, "maritime-temperate-sea") == 0) rf.climate = CLIMATE__MARITIME_TEMPERATE_OVER_SEA;
+                else { fprintf(stderr, "terrain_viewer: unknown --climate '%s'\n", name); fprintf(stderr, usage, argv[0]); return 1; }
+                argi += 2;
+            } else if (strcmp(argv[argi], "--pol") == 0 && argi + 1 < argc) {
+                if (strcmp(argv[argi + 1], "h") == 0) rf.pol = POLARIZATION__HORIZONTAL;
+                else if (strcmp(argv[argi + 1], "v") == 0) rf.pol = POLARIZATION__VERTICAL;
+                else { fprintf(stderr, "terrain_viewer: --pol must be 'h' or 'v'\n"); fprintf(stderr, usage, argv[0]); return 1; }
+                argi += 2;
+            } else if (strcmp(argv[argi], "--permittivity") == 0 && argi + 1 < argc) {
+                rf.epsilon = atof(argv[argi + 1]);
+                argi += 2;
+            } else if (strcmp(argv[argi], "--conductivity") == 0 && argi + 1 < argc) {
+                rf.sigma = atof(argv[argi + 1]);
+                argi += 2;
+            } else if (strcmp(argv[argi], "--refractivity") == 0 && argi + 1 < argc) {
+                rf.N0 = atof(argv[argi + 1]);
+                argi += 2;
             } else {
                 screenshot = argv[argi];
                 argi++;
             }
+        }
+        if (rf.useItm && !rf.enabled) {
+            fprintf(stderr, "terrain_viewer: --itm requires --erp (the RF model must be enabled)\n");
+            fprintf(stderr, usage, argv[0]);
+            return 1;
         }
         return RunViewshedMode(lat, lon, heightFt, maxDistanceKm, &rf, screenshot);
     }

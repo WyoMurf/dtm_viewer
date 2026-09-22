@@ -108,6 +108,13 @@ logic (no raylib needed): `./dtm_fetch_test cacheDir lat lon` ensures
 coverage at that point (downloading if needed, prompting unless
 `TV_AUTO_DOWNLOAD=1`) and prints the sampled elevation there.
 
+`make longley_rice_test` builds a standalone validation harness (no
+raylib needed) for the `--itm` viewshed option's underlying model: it
+replays the NTIA reference implementation's own `p2p.csv`/`pfls.csv`
+test vectors through the ported `longley_rice.c` and checks the result
+against each expected answer (0.1 dB tolerance; observed discrepancies
+are ~0.005 dB, likely just floating-point evaluation-order differences).
+
 RUNNING -- walkthrough mode:
 
     ./terrain_viewer [cody|meeteetse|bighorn]
@@ -215,6 +222,21 @@ RUNNING -- viewshed mode:
                      geometric LOS map)
       --freq MHz     carrier frequency in MHz (default: 869, cellular Band A)
       --sens dBm     receiver sensitivity threshold (default: -100)
+      --itm          use the full Longley-Rice/ITM point-to-point model
+                     instead of the simpler single-knife-edge estimate
+                     below (requires --erp; see ITM subsection below)
+      --climate NAME one of: equatorial, continental-subtropical,
+                     maritime-subtropical, desert, continental-temperate
+                     (default), maritime-temperate-land,
+                     maritime-temperate-sea -- ITM only
+      --pol h|v      polarization, horizontal or vertical (default: v) --
+                     ITM only
+      --permittivity E  relative permittivity of the ground (default: 15)
+                     -- ITM only
+      --conductivity S  ground conductivity, S/m (default: 0.005) --
+                     ITM only
+      --refractivity N  surface refractivity, N-units (default: 301) --
+                     ITM only
 
 Given a tower's position and antenna height (`+height`, same `+`/unit-
 suffix convention as `--profile`, 0 if omitted), rasterizes a
@@ -255,12 +277,55 @@ line -- particularly noticeable at low cellular bands like 850MHz
 spectrum for rural/terrain-heavy coverage.
 
 What this does **not** model, even with `--erp`: multiple obstructions
-along one path (only the single dominant one, unlike full multi-edge
-models such as Longley-Rice/ITM -- the FCC's own standard, and a much
-bigger undertaking were it ever worth porting), antenna radiation pattern
+along one path (only the single dominant one), antenna radiation pattern
 (isotropic assumed), ground conductivity/reflection, foliage or building
 clutter, or troposcatter. Treat this as a solid, physically-grounded
-estimate for scouting -- not a substitute for a real RF site survey.
+estimate for scouting -- not a substitute for a real RF site survey. For
+a more complete model, see `--itm` below.
+
+**`--itm`: the full Longley-Rice/ITM model.** Adding `--itm` (in addition
+to `--erp`) swaps the single-knife-edge estimate above for a faithful C
+port of the NTIA/ITS Irregular Terrain Model, point-to-point mode --
+the FCC's own standard propagation model, and the same algorithm behind
+most professional RF coverage-planning tools. `longley_rice.c`/`.h` is a
+mechanical translation of the official public-domain C++ reference
+(https://github.com/NTIA/itm, Title 15 USC 105), validated against 5 of
+that repo's own worked test cases to within 0.005 dB
+(`longley_rice_test`, `p2p.csv`/`pfls.csv`). Unlike the single-knife-edge
+model, ITM accounts for the *entire* digitized terrain profile between
+tower and target (multiple knife-edges, smooth-earth diffraction,
+line-of-sight two-ray interference, and troposcatter, whichever regime
+the path geometry falls into), plus empirical time/location/situation
+variability -- which is why an `--itm` map typically shows tighter,
+more valley-confined coverage than the knife-edge map for the same
+scenario: real multi-ridge terrain attenuates a signal more than
+tracking only the single worst obstruction suggests.
+
+ITM needs a handful of regional constants the simpler model doesn't --
+ground electrical properties and atmosphere/climate -- all defaulted to
+standard "average" values (continental temperate climate, vertical
+polarization, permittivity 15, conductivity 0.005 S/m, surface
+refractivity 301 N-units) rather than requiring anyone to look them up,
+matching how most real ITM-based studies work absent a specific reason
+to override them; `--climate`/`--pol`/`--permittivity`/`--conductivity`/
+`--refractivity` override any of them. Internally, this build always
+uses ITM's "TLS" (time/location/situation) variability mode at the
+50th percentile for all three (a representative single prediction,
+not a tunable reliability/confidence curve) -- the confidence/reliability
+(CR) variability variant and ITM's area-prediction mode (no explicit
+terrain profile) are both out of scope for this port, since point-to-point
+TLS against a real digitized profile is what's useful for the kind of
+siting/surveying work this tool is for.
+
+Because a full ITM evaluation costs meaningfully more than the
+knife-edge formula (its input is an entire terrain profile, not just one
+running horizon angle), `--itm` mode samples each ray at a coarser fixed
+radial spacing (up to ~150 points per bearing, however many
+`maxDistanceKm` needs) rather than the knife-edge sweep's much finer
+per-pixel step, while keeping the same full angular resolution -- so
+`--itm` viewsheds take noticeably longer to compute (seconds, not
+instant) but don't show angular streaking, only a slightly coarser
+radial transition near sharp terrain features than the knife-edge model.
 
 Each map point is tested at `VIEWSHED_RECEIVER_HEIGHT_M` (1.5m, a typical
 handset/vehicle height) above the DTM's bare-ground elevation there, while

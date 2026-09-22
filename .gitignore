@@ -1,4 +1,9 @@
 *.o
 dtm_test
 terrain_viewer
+dtm_fetch_test
+probe_points
+los_check
+longley_rice_test
+longley_rice_test.exe
 *.png

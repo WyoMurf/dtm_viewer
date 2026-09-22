@@ -20,6 +20,9 @@ dtm_fetch.o: dtm_fetch.c include/dtm_fetch.h include/dtm.h
 osm_roads.o: osm_roads.c include/osm_roads.h
 	$(CC) $(CFLAGS) -std=gnu11 -Iinclude -c osm_roads.c -o $@
 
+longley_rice.o: longley_rice.c include/longley_rice.h
+	$(CC) $(CFLAGS) -std=gnu11 -O2 -Iinclude -c longley_rice.c -o $@
+
 # Standalone sanity check for dtm.c/dtm.h, with no raylib dependency --
 # point it at one or more DTM GeoTIFFs and it prints elevation at a few
 # known lat/lon probes plus a coarse per-file min/max scan. See README.md.
@@ -29,8 +32,8 @@ dtm_test: dtm.c include/dtm.h
 # -O3 matters a lot here: at -O0, raymath.h's Vector3* helpers don't get
 # inlined despite being declared `static inline`, costing real per-frame CPU
 # in the terrain/profile render loops.
-terrain_viewer: terrain_viewer.c include/dtm.h include/dtm_fetch.h include/osm_roads.h include/geo_utils.h geo_utils.o dtm.o dtm_fetch.o osm_roads.o
-	$(CC) $(CFLAGS) -std=gnu11 -O3 terrain_viewer.c geo_utils.o dtm.o dtm_fetch.o osm_roads.o -o $@ -Iinclude -I$(RAYLIB_DIR) -L$(RAYLIB_DIR) -Wl,-rpath,$(RAYLIB_DIR) -lraylib -lGL -lm -lpthread -ldl -lrt -lX11 -ltiff
+terrain_viewer: terrain_viewer.c include/dtm.h include/dtm_fetch.h include/osm_roads.h include/geo_utils.h include/longley_rice.h geo_utils.o dtm.o dtm_fetch.o osm_roads.o longley_rice.o
+	$(CC) $(CFLAGS) -std=gnu11 -O3 terrain_viewer.c geo_utils.o dtm.o dtm_fetch.o osm_roads.o longley_rice.o -o $@ -Iinclude -I$(RAYLIB_DIR) -L$(RAYLIB_DIR) -Wl,-rpath,$(RAYLIB_DIR) -lraylib -lGL -lm -lpthread -ldl -lrt -lX11 -ltiff
 
 # Headless terrain-scouting helpers, no raylib dependency -- see README.md's
 # SCOUTING TOOLS section. Both read points from stdin so they're easy to
@@ -47,5 +50,11 @@ los_check: los_check.c include/dtm.h include/geo_utils.h dtm.o geo_utils.o
 dtm_fetch_test: dtm_fetch_test.c include/dtm_fetch.h include/dtm.h dtm.o dtm_fetch.o
 	$(CC) $(CFLAGS) -std=gnu11 -O2 -Iinclude dtm_fetch_test.c dtm.o dtm_fetch.o -o $@ -ltiff -lm
 
+# Standalone validation harness for longley_rice.c against the NTIA
+# reference implementation's own test vectors (p2p.csv/pfls.csv) -- see
+# README.md's DATA SOURCES / viewshed section.
+longley_rice_test: longley_rice_test.c include/longley_rice.h longley_rice.o
+	$(CC) $(CFLAGS) -std=gnu11 -O2 -Iinclude longley_rice_test.c longley_rice.o -o $@ -lm
+
 clean:
-	rm -f geo_utils.o dtm.o dtm_fetch.o osm_roads.o dtm_test terrain_viewer probe_points los_check dtm_fetch_test
+	rm -f geo_utils.o dtm.o dtm_fetch.o osm_roads.o longley_rice.o dtm_test terrain_viewer probe_points los_check dtm_fetch_test longley_rice_test
