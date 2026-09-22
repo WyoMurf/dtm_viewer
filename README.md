@@ -317,6 +317,97 @@ done: generate a grid of candidate points, batch-test all of them against
 the towers and the target addresses with `los_check`, then confirm the
 winner visually with a real `--profile` screenshot before trusting it.
 
+CASE STUDY -- siting a passive reflector for Meeteetse (KNKN312/KNKN244):
+
+Worked example of using this tool end to end for a real passive-reflector
+siting problem, kept here because the method (not just the specific
+answer) is reusable for the next one.
+
+**The problem.** Two real cell sites, KNKN312 (44.14206,-108.824333) and
+KNKN244 (44.143611,-108.822222), sit just east of Meeteetse; several
+addresses on the west side of town (Target 1, Target 2, Target 3, Target 4, Target 5, Target 6, Target 7 --
+an eighth candidate address was dropped once it was confirmed to already have reception)
+don't have a clear line from either tower, per `--profile`/`los_check`
+against the loaded Wyoming lidar tiles.
+
+**Site search.** A grid of candidate points (`destination_point` fanned
+out at various bearings/distances from the address cluster, piped through
+`los_check`) found plenty of points with geometric line-of-sight to both
+the towers and the addresses -- but LOS alone isn't enough. The first
+"perfect LOS" candidate sat almost exactly on the straight line between a
+tower and two of the addresses (included angle ~175-179 deg), which is
+useless for a flat mirror: at that near-zero deviation a reflector would
+need to operate at grazing incidence (see the sizing formula below --
+effective area scales with cos(theta), theta = deviation/2, and cos(90
+deg) = 0). The fix was re-scanning for sites *off* the direct tower-
+address line, filtering for a genuine bend angle (roughly 60-130 deg is
+comfortable), not just raw visibility. Testing actual public-facility
+addresses (fire district, sheriff's office -- named, known lease-free
+land along the through-town highway corridor) turned out to beat every
+private-parcel candidate found by blind grid search, both for siting ease
+and for reflector size.
+
+**Sizing a flat-plate reflector.** For two path legs of length d1, d2 (km)
+via a flat plate of physical area A (m^2) at incidence angle theta from
+the plate's normal (effective area Ae = A*cos(theta)), the isolated-
+antenna path loss through the reflector is:
+
+    L_dB = 142.0 + 20*log10(d1) + 20*log10(d2) - 20*log10(Ae)
+
+(derived from treating the plate as an aperture that both intercepts and
+re-radiates -- notably frequency-independent, which is the standard,
+slightly counterintuitive result for flat passive reflectors: loss
+depends on plate area, path lengths, and incidence angle, not on
+wavelength.) Solving for the minimum Ae that closes the link against a
+transmitter's EIRP and a receiver's sensitivity threshold, then A =
+Ae/cos(theta), gives the required physical plate size -- this is exactly
+what turned "the same site is either <1m^2 or basically infinite depending
+on where you put it" from a vague warning into a concrete go/no-go check
+per candidate.
+
+**Result.** Best site found: the Park County Sheriff's Office lot
+(44.157895,-108.870449), on a 40ft mast. Confirmed clear (fresh
+`los_check` run, not just distance/elevation estimates) to both towers
+(4.08-4.16km, 6+m margin) and all 7 remaining addresses (318-832m,
+2.7-3.0m margin), with bend angles from 75-129 deg -- comfortably clear
+of the grazing problem. Required plate size peaks at 1.23 m^2 (Target 3, the longest/worst-angled leg); every other address needs less.
+
+**Construction.** At 869 MHz (cellular Band A, lambda ~345mm), flatness
+only needs to hold to about lambda/16-lambda/20 (~17-22mm) -- the
+Rayleigh criterion used for reflector-antenna surfaces generally, and
+comfortably loose for a ~1m panel built with ordinary sheet-metal
+fabrication. No optical-grade polish needed; "smooth" here means smooth
+relative to a 345mm wavelength, not visible light. A mesh (not a solid
+plate) works identically as long as the openings stay under roughly
+lambda/10 (~35mm); this cuts wind loading substantially for a panel this
+size on a 40-80ft mast. Standard stainless steel window screen (~1.1-
+1.4mm openings) is 15-30x finer than that threshold and, despite being a
+noticeably worse conductor than aluminum (~1.45e6 vs ~3.5e7 S/m), still
+reflects with negligible extra loss at this frequency -- the same reason
+stainless mesh is standard material for RF shielding enclosures generally.
+
+**Orientation.** By the law of reflection, the plate's face (its outward
+normal) should bisect the bearing to the transmitter and the bearing to
+the target, for each address individually; since a panel this size (a
+few wavelengths across at 869MHz) has a fairly wide natural beam, one
+compromise orientation covering the whole spread of target bearings is
+sufficient rather than needing per-address aiming. For the Sheriff's
+Office site: tower bearing ~114 deg, target bearings 188-242 deg, giving
+individual ideal facings of 151-178 deg and an overall compromise of
+**160 deg true**. Bearings from this tool (`geo_utils.h`) are relative to
+true north; converting to a compass heading needs the local magnetic
+declination (9.92 deg E at this exact site as of September 2026, per
+NOAA/NCEI's WMM-2025 calculator -- https://www.ngdc.noaa.gov/geomag/calculators/magcalc.shtml,
+drifting about -0.09 deg/year here), giving **~150 deg on a hand
+compass**. Verify with a real signal meter at a few target addresses
+once mounted -- this estimate is a starting point for the physical
+install, not a substitute for field tuning.
+
+**Not covered by this tool**: structural/lightning-protection grounding
+for the mast and panel (NEC Article 810 territory, especially relevant
+here since the site is a public-safety facility) -- that belongs with a
+licensed electrician or tower installer, not a terrain/RF estimate.
+
 KNOWN LIMITATIONS (deliberate v1 scope, not oversights):
 
 - The walkthrough is one regenerable heightfield window, not a proper
