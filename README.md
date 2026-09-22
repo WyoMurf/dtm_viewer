@@ -351,11 +351,13 @@ siting problem, kept here because the method (not just the specific
 answer) is reusable for the next one.
 
 **The problem.** Two real cell sites, KNKN312 (44.14206,-108.824333) and
-KNKN244 (44.143611,-108.822222), sit just east of Meeteetse; several
-addresses on the west side of town (Target 1, Target 2, Target 3, Target 4, Target 5, Target 6, Target 7 --
-an eighth candidate address was dropped once it was confirmed to already have reception)
-don't have a clear line from either tower, per `--profile`/`los_check`
-against the loaded Wyoming lidar tiles.
+KNKN244 (44.143611,-108.822222), sit just east of Meeteetse; seven
+specific residential addresses on the west side of town -- identifying
+which houses currently lack coverage, so deliberately not named here even
+though this repo is private -- don't have a clear line from either tower,
+per `--profile`/`los_check` against the loaded Wyoming lidar tiles. (An
+eighth candidate address was dropped once confirmed to already have
+reception.) The addresses are referred to below as Target 1-7.
 
 **Site search.** A grid of candidate points (`destination_point` fanned
 out at various bearings/distances from the address cluster, piped through
@@ -397,7 +399,8 @@ per candidate.
 `los_check` run, not just distance/elevation estimates) to both towers
 (4.08-4.16km, 6+m margin) and all 7 remaining addresses (318-832m,
 2.7-3.0m margin), with bend angles from 75-129 deg -- comfortably clear
-of the grazing problem. Required plate size peaks at 1.23 m^2 (Target 3, the longest/worst-angled leg); every other address needs less.
+of the grazing problem. Required plate size peaks at 1.23 m^2 (Target 3,
+the longest/worst-angled leg); every other address needs less.
 
 A backup was checked the same way ~250m down the same street: the
 Meeteetse Fire District lot (44.157664,-108.870856) also clears every
